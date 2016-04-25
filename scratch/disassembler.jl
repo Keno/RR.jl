@@ -79,6 +79,12 @@ function getInstruction(data::Vector{UInt8}, offset; ctx = DisAsmContext())
   (Inst, InstSize)
 end
 
+function mayAffectControlFlow(inst, ctx)
+  icxx"""
+    $(ctx.MII)->get($inst->getOpcode()).mayAffectControlFlow(*$inst,*$(ctx.MRI));
+  """
+end
+
 #=
 function disassembleInstruction(f::Function, data::Vector{UInt8}, offset; ctx = DisAsmContext())
   icxx"""
@@ -115,7 +121,6 @@ function Base.show(io::IO, Inst::pcpp"llvm::MCInst")
   O;
   """))
 end
-
 
 free(x::pcpp"llvm::MCInst") = icxx" delete $x; "
 

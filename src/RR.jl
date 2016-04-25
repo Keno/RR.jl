@@ -37,6 +37,11 @@ module RR
         icxx"$session->replay_step(rr::RUN_SINGLESTEP);"
     end
 
+    function step_until_bkpt!(session)
+        while !icxx"$session->replay_step(rr::RUN_CONTINUE).break_status.breakpoint_hit;"
+        end
+    end
+
     function Base.show(io::IO, frame::rcpp"rr::TraceFrame")
         print(io,icxx"$frame.ticks();",": ")
         print_with_color(:green,io,bytestring(icxx"$frame.event().str();"))

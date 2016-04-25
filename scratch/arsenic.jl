@@ -18,6 +18,7 @@ cxx"""
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/TargetRegistry.h"
+#include "llvm/MC/MCInstrInfo.h"
 using namespace llvm;
 """
 
@@ -47,12 +48,46 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:disas}, command)
     return false
 end
 
-function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:si}, command)
-    RR.single_step!(session)
+function update_stack!(state)
     did_fixup, regs = RR.fixup_RC(current_task(session), icxx"$(current_task(session))->regs();")
     stack = Gallium.stackwalk(regs, current_task(session), modules, rich_c = true)
     stack[end].stacktop = !did_fixup
     state.interp = state.top_interp = Gallium.NativeStack(stack,state.top_interp.modules)
+end
+
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:si}, command)
+    RR.single_step!(session)
+    update_stack!(state)
+    return true
+end
+
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:ip}, command)
+    x = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
+    println(x.ip)
+    return false
+end
+
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:nb}, command)
+    # First determine the ip of the next branch
+    base, loc, insts = get_insts(stack)
+    x = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
+    ctx = DisAsmContext()
+    Offset = UInt(x.ip - loc - base)
+    branchip = 0
+    while Offset <= sizeof(insts)
+        (Inst, InstSize) = getInstruction(insts, Offset; ctx = ctx)
+        if mayAffectControlFlow(Inst,ctx)
+            branchip = base + loc + Offset
+            break
+        end
+        Offset += InstSize
+        free(Inst)
+    end
+    @assert branchip != 0
+    icxx"$(current_task(session))->vm()->add_breakpoint($branchip,rr::BKPT_USER);"
+    RR.step_until_bkpt!(session)
+    icxx"$(current_task(session))->vm()->remove_breakpoint($branchip,rr::BKPT_USER);"
+    update_stack!(state)
     return true
 end
 
@@ -79,7 +114,8 @@ indicator which instruction is at ipoffset.
 function disasm_around_ip(io, insts, ipoffset; ipbase = 0, circular = true)
     Offset = 0
     ctx = DisAsmContext()
-    buf = circular ? CircularBuffer{Tuple{Int,AbstractString}}(5) : Vector{Tuple{Int,AbstractString}}()
+    const InstInfo = Tuple{Int,Bool,AbstractString}
+    buf = circular ? CircularBuffer{InstInfo}(5) : Vector{InstInfo}()
     targetn = typemax(Int64)
     ipinstoffset = 0
     while Offset < sizeof(insts) && targetn > 0
@@ -88,7 +124,8 @@ function disasm_around_ip(io, insts, ipoffset; ipbase = 0, circular = true)
         Offset += InstSize
         iobuf = IOContext(IOBuffer(),:disasmctx=>ctx)
         print(iobuf, Inst)
-        push!(buf, (lastoffset, takebuf_string(iobuf.io)))
+        push!(buf, (lastoffset, mayAffectControlFlow(Inst,ctx),
+            takebuf_string(iobuf.io)))
         targetn -= 1
         if circular && Offset > ipoffset && targetn > 2 # Two more
             ipinstoffset = lastoffset
@@ -97,10 +134,19 @@ function disasm_around_ip(io, insts, ipoffset; ipbase = 0, circular = true)
         free(Inst)
     end
     for i = 1:length(buf)
-        off, inst = buf[i]
-        print(io, off == ipinstoffset ? "=> " : "   ")
-        print(io, "0x",hex(UInt64(ipbase+off),2sizeof(UInt64)),"<+",off,">:")
-        println(io, inst)
+        off, branch, inst = buf[i]
+        attarget = off == ipinstoffset
+        p = string(attarget ? "=> " : "   ",
+            "0x",hex(UInt64(ipbase+off),2sizeof(UInt64)),"<+",off,">:",
+            inst)
+        if attarget
+            print_with_color(:yellow, io, p)
+        elseif branch
+            print_with_color(:red, io, p)
+        else
+            print(io, p)
+        end
+        println(io)
     end
 end
 

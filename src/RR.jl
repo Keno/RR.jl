@@ -2,9 +2,9 @@ module RR
 
     using Cxx
     using Gallium
-    import Gallium: load, mapped_file
+    import Gallium: load, mapped_file, enable, disable
     using ObjFileBase
-    
+
     function __init__()
         Libdl.dlopen(joinpath(ENV["HOME"],"rr-build/lib/librrlib.so"),
             Libdl.RTLD_GLOBAL)
@@ -13,32 +13,85 @@ module RR
         cxx"""
             #include <ReplaySession.h>
             #include <ReplayTask.h>
+            #include <ReplayTimeline.h>
         """
     end
     __init__()
-    
-    const ReplaySession = cxxt"rr::ReplaySession::shr_ptr"
-    
+
+    const ReplaySession = Union{cxxt"rr::ReplaySession::shr_ptr",pcpp"rr::ReplaySession"}
+    const ReplayTimeline = Union{pcpp"rr::ReplayTimeline"}
+
     function Base.current_task(session::ReplaySession)
-        icxx"$session->current_task();"
+        @assert icxx"$session != 0;"
+        task = icxx"$session->current_task();"
+        @assert task != 0
+        task
     end
-    
+
+    current_session(timeline::ReplayTimeline) = icxx"&$timeline->current_session();"
+
     function step_until_exec!(session)
         while !icxx"$session->done_initial_exec();"
             step!(session)
         end
     end
-    
+
     function step!(session)
         icxx"$session->replay_step(rr::RUN_CONTINUE);"
     end
-    
+
+    function step!(session, target)
+        icxx"""
+            rr::ReplaySession::StepConstraints c(rr::RUN_CONTINUE);
+            c.ticks_target = $target;
+            $session->replay_step(c);
+        """
+    end
+
+    function reverse_single_step!(session, task, timeline)
+        icxx"""
+        auto stop_filter = [&](rr::ReplayTask* t) -> bool {
+            return true;
+        };
+        auto interrupt_check = [&]() { return false; };
+        $timeline->reverse_singlestep(
+            $task->tuid(), $task->tick_count(), stop_filter, interrupt_check);
+        """
+    end
+
     function single_step!(session)
         icxx"$session->replay_step(rr::RUN_SINGLESTEP);"
     end
 
-    function step_until_bkpt!(session)
-        while !icxx"$session->replay_step(rr::RUN_CONTINUE).break_status.breakpoint_hit;"
+    function single_step!(timeline::ReplayTimeline)
+        # To get past any breakpoints, check if our current location
+        # is a breakpoint location and if so, temporarily clear it
+        # while stepping past.
+        did_disable = false
+        loc = Gallium.Location(timeline,
+            ip(icxx"$(current_task(current_session(timeline)))->regs();"))
+        if haskey(Gallium.bps_at_location, loc)
+            disable(loc)
+            did_disable = true
+        end
+        single_step!(current_session(timeline))
+        if did_disable
+            enable(loc)
+        end
+    end
+
+    function step_until_bkpt!(session::ReplaySession)
+        while disable_sigint() do
+                !icxx"$session->replay_step(rr::RUN_CONTINUE).break_status.breakpoint_hit;"
+            end
+        end
+    end
+
+    function step_until_bkpt!(timeline::ReplayTimeline)
+        while disable_sigint() do
+                !icxx"$(current_session(timeline))->replay_step(rr::RUN_CONTINUE).break_status.breakpoint_hit;"
+            end
+            icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
         end
     end
 
@@ -50,21 +103,17 @@ module RR
                 icxx"rr::state_name($frame.event().Syscall().state);"))
         end
     end
-    
-    function read_exe(vm)
-       readmeta(IOBuffer(open(read,bytestring(icxx"$vm->exe_image();"))))
-   end
+
+    function read_exe(task)
+        @assert task != C_NULL
+        readmeta(IOBuffer(open(read,bytestring(icxx"$task->vm()->exe_image();"))))
+    end
 
     function read_exe(session::ReplaySession)
-        t = current_task(session)
-        @assert t != C_NULL
-        read_exe(icxx"$t->vm();")
+        read_exe(current_task(session))
     end
-    
-    const AddrSpace = cxxt"rr::AddressSpace::shr_ptr"
-    
-    
-    
+
+
     # Remote memory operations
     function Cxx.cppconvert{T}(ptr::RemotePtr{T})
         icxx"rr::remote_ptr<$T>{$(ptr.ptr)};"
@@ -76,7 +125,7 @@ module RR
         icxx"$ptr.register_value();"
     Base.convert{T}(::Type{UInt64}, ptr::cxxt"rr::remote_ptr<$T>") =
         icxx"$ptr.as_int();"
-    
+
     typealias RRRemotePtr{T} Union{RemotePtr{T}, cxxt"rr::remote_ptr<$T>"}
     function load{T<:Cxx.CxxBuiltinTypes}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
@@ -94,8 +143,7 @@ module RR
         res
     end
 
-    saved_auxv(vm::AddrSpace) = map(unsafe_load,icxx"$vm->saved_auxv();")
-    saved_auxv(vm::pcpp"rr::ReplayTask") = saved_auxv(icxx"$vm->vm();")
+    saved_auxv(vm::pcpp"rr::ReplayTask") = map(unsafe_load,icxx"$vm->vm()->saved_auxv();")
 
     function mapped_file(vm::pcpp"rr::ReplayTask", ptr)
         @assert icxx"$vm->vm()->has_mapping($ptr);"
@@ -108,7 +156,7 @@ module RR
             imageh.file.header.e_entry
         load_library_map(task, imageh, slide)
     end
-    
+
     # Registers
     import Gallium.Registers: ip, invalidate_regs!, set_sp!, set_ip!, set_dwarf!, get_dwarf
     const RRRegisters = Union{rcpp"rr::Registers",vcpp"rr::Registers"}
@@ -139,15 +187,14 @@ module RR
     function fixup_RC(task::pcpp"rr::ReplayTask", RC)
         RC = copy(RC)
         theip = ip(RC)
-        vm = icxx"$task->vm();"
         did_fixup = false
-        if UInt64(icxx"$vm->rr_page_start();") <= UInt64(theip) <= UInt64(icxx"$vm->rr_page_start() +
-                $vm->rr_page_size();")
+        if UInt64(icxx"$task->vm()->rr_page_start();") <= UInt64(theip) <= UInt64(icxx"$task->vm()->rr_page_start() +
+                $task->vm()->rr_page_size();")
             set_ip!(RC,load(task, RemotePtr{RemoteCodePtr}(icxx"$RC.sp();")))
             set_sp!(RC,UInt64(icxx"$RC.sp();")+sizeof(Ptr{Void}))
             did_fixup = true
         end
         did_fixup, RC
     end
-    
+
 end # module

@@ -1,10 +1,19 @@
 using RR; using Cxx
+using RR: current_session
 session = icxx"""rr::ReplaySession::create("");"""
-RR.step_until_exec!(session); for i = 1:2000; RR.step!(session); end
-imageh = RR.read_exe(session)
-modules = Gallium.GlibcDyldModules.load_library_map(current_task(session), imageh)
-did_fixup, regs = RR.fixup_RC(current_task(session), icxx"$(current_task(session))->regs();")
-stack = Gallium.stackwalk(regs, current_task(session), modules, rich_c = true)
+timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
+session = nothing
+icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+RR.step_until_exec!(current_session(timeline))
+icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+for i = 1:2000;
+RR.step!(current_session(timeline));
+icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+end
+imageh = RR.read_exe(current_session(timeline))
+modules = Gallium.GlibcDyldModules.load_library_map(current_task(current_session(timeline)), imageh)
+did_fixup, regs = RR.fixup_RC(current_task(current_session(timeline)), icxx"$(current_task(current_session(timeline)))->regs();")
+stack = Gallium.stackwalk(regs, current_task(current_session(timeline)), modules, rich_c = true)
 stack[end].stacktop = !did_fixup
 
 cxx"""
@@ -28,6 +37,7 @@ include(Pkg.dir("RR","scratch","disassembler.jl"))
 using DWARF.CallFrameInfo
 using Gallium.Unwinder: find_fde
 using ObjFileBase: handle
+using Gallium: Location
 
 function get_insts(stack)
     stack = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
@@ -49,14 +59,20 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:disas}, command)
 end
 
 function update_stack!(state)
-    did_fixup, regs = RR.fixup_RC(current_task(session), icxx"$(current_task(session))->regs();")
-    stack = Gallium.stackwalk(regs, current_task(session), modules, rich_c = true)
+    did_fixup, regs = RR.fixup_RC(current_task(current_session(timeline)), icxx"$(current_task(current_session(timeline)))->regs();")
+    stack = Gallium.stackwalk(regs, current_task(current_session(timeline)), modules, rich_c = true)
     stack[end].stacktop = !did_fixup
     state.interp = state.top_interp = Gallium.NativeStack(stack,state.top_interp.modules)
 end
 
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:si}, command)
-    RR.single_step!(session)
+    RR.single_step!(timeline)
+    update_stack!(state)
+    return true
+end
+
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:rsi}, command)
+    RR.reverse_single_step!(current_session(timeline),current_task(current_session(timeline)),timeline)
     update_stack!(state)
     return true
 end
@@ -64,6 +80,12 @@ end
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:ip}, command)
     x = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
     println(x.ip)
+    return false
+end
+
+function ASTInterpreter.execute_command(state, stack, ::Val{:when}, command)
+    show(STDOUT, UInt64(icxx"$(current_task(current_session(timeline)))->tick_count();"))
+    println(STDOUT); println(STDOUT)
     return false
 end
 
@@ -84,9 +106,9 @@ function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,
         free(Inst)
     end
     @assert branchip != 0
-    icxx"$(current_task(session))->vm()->add_breakpoint($branchip,rr::BKPT_USER);"
-    RR.step_until_bkpt!(session)
-    icxx"$(current_task(session))->vm()->remove_breakpoint($branchip,rr::BKPT_USER);"
+    icxx"$(current_task(current_session(timeline)))->vm()->add_breakpoint($branchip,rr::BKPT_USER);"
+    RR.step_until_bkpt!(current_session(timeline))
+    icxx"$(current_task(current_session(timeline)))->vm()->remove_breakpoint($branchip,rr::BKPT_USER);"
     update_stack!(state)
     return true
 end
@@ -168,6 +190,153 @@ function ASTInterpreter.print_frame(io, num, x::Gallium.CStackFrame)
       print(io, " at ",x.file,":",x.line)
     end
     println(io)
+end
+
+function count_total_ticks(reader)
+    icxx"""
+        $reader.rewind();
+        rr::TraceFrame frame;
+        while (true) {
+            rr::TraceFrame next_frame = $reader.read_frame();
+            if ($reader.at_end())
+                break;
+            frame = next_frame;
+        }
+        frame.ticks();
+    """
+end
+total_ticks = count_total_ticks(icxx"rr::TraceReader{$(current_session(timeline))->trace_reader()};")
+
+using TerminalExtensions; using Gadfly; using Colors
+const repl_theme = Gadfly.Theme(
+    panel_fill=colorant"black", default_color=colorant"orange", major_label_color=colorant"white",
+    minor_label_color=colorant"white", key_label_color=colorant"white", key_title_color=colorant"white",
+    line_width=1mm
+   )
+eval(Gadfly,quote
+   function writemime(io::IO, ::MIME"image/png", p::Plot)
+       draw(PNG(io, Compose.default_graphic_width,
+                Compose.default_graphic_height), p)
+   end
+end)
+
+function collect_mark_ticks()
+    map(unsafe_load,icxx"""
+    std::vector<uint64_t> ticks;
+    for(auto it : $timeline->reverse_exec_checkpoints) {
+        ticks.push_back(it.first.ptr->key.ticks);
+    }
+    ticks;
+    """)
+end
+
+function collect_mark_ticks(marks)
+    ticks = UInt[]
+    for mark in marks
+        push!(ticks, icxx"$mark.ptr->key.ticks;")
+    end
+    ticks
+end
+
+function ASTInterpreter.execute_command(state, stack, ::Val{:timeline}, command)
+    me = UInt64(icxx"$(current_task(current_session(timeline)))->tick_count();")
+    ticks = []
+    contains(command, "internal") && (ticks = collect_mark_ticks())
+    explicit_ticks = collect_mark_ticks(mark_stack)
+    colors = [colorant"orange",colorant"green",colorant"purple"]
+    (length(ticks) != 0) && unshift!(colors, colorant"blue")
+    display(
+    plot(x=[ticks...,0,me,23549392659,explicit_ticks...],
+        y=[zeros(Int,length(ticks))...,0,0,0,zeros(Int,length(explicit_ticks))...],
+        color=[[:internal_tick for _ in 1:length(ticks)]...,:end,:me,:end,
+            [:explicit_tick for _ in 1:length(explicit_ticks)]...],
+        Geom.point,Geom.line,repl_theme,Guide.xlabel("Time"),
+        Guide.ylabel("Timeline"),
+        Scale.color_discrete_manual(colors...))
+    )
+    println()
+    println("The timeline is intact.")
+    return false
+end
+
+const mark_stack = Any[]
+function ASTInterpreter.execute_command(state, stack, ::Val{:mark}, command)
+    push!(mark_stack,icxx"$timeline->mark();")
+    return false
+end
+
+using ProgressMeter
+when(session) = UInt64(icxx"$(current_task(session))->tick_count();")
+when() = when(current_session(timeline))
+function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
+    subcmd = split(command)[2:end]
+    if startswith(subcmd[1],"@")
+        n = parse(Int, subcmd[1][2:end])
+        icxx"$timeline->seek_to_mark($(mark_stack[n]));"
+        println("We have arrived.")
+        update_stack!(state)
+        return true
+    end
+    n = parse(Int, subcmd[1])
+    me = when()
+    target = me + n
+    p = Progress(n, 1, "Time travel in progress (forwards)...", 50)
+    while when() < target
+        res = RR.step!(current_session(timeline), target)
+        if icxx"$res.break_status.approaching_ticks_target;"
+            break
+        end
+        icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+        now = when()
+        now != me && ProgressMeter.update!(p, Int64(now - me))
+    end
+    while when() < target
+        res = RR.single_step!(current_session(timeline))
+        now = when()
+        now != me && ProgressMeter.update!(p, Int64(now - me))
+    end
+    println("We have arrived.")
+    update_stack!(state)
+    return true
+end
+
+function Gallium.breakpoint(timeline::RR.ReplayTimeline, fname::Symbol)
+    h, base, sym = Gallium.lookup_sym(modules, fname)
+    addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
+    Gallium.breakpoint(timeline, addr)
+end
+
+function Gallium.breakpoint(timeline::RR.ReplayTimeline, addr)
+    bp = Gallium.Breakpoint()
+    Gallium.add_location(bp, Gallium.Location(timeline, addr))
+    bp
+end
+
+function Gallium.enable(timeline::RR.ReplayTimeline, loc::Location)
+    icxx"$timeline->add_breakpoint(
+            $(current_task(current_session(timeline))), $(loc.addr));"
+end
+
+function Gallium.disable(timeline::RR.ReplayTimeline, loc::Location)
+    icxx"$timeline->remove_breakpoint(
+            $(current_task(current_session(timeline))), $(loc.addr));"
+end
+
+function Gallium.print_location(io::IO, vm::RR.ReplayTimeline, loc)
+    print(io, "In RR timeline at address ")
+    show(io, loc.addr)
+    println(io)
+end
+
+function ASTInterpreter.execute_command(state, stack, ::Val{:c}, command)
+    RR.single_step!(timeline)
+    try
+        RR.step_until_bkpt!(timeline)
+    catch err
+        !isa(err, InterruptException) && rethrow(err)
+    end
+    update_stack!(state)
+    return true
 end
 
 ASTInterpreter.RunDebugREPL(Gallium.NativeStack(stack, modules))

@@ -331,7 +331,7 @@ end
 function ASTInterpreter.execute_command(state, stack, ::Val{:c}, command)
     RR.single_step!(timeline)
     try
-        RR.step_until_bkpt!(timeline)
+        RR.continue!(timeline)
     catch err
         !isa(err, InterruptException) && rethrow(err)
     end

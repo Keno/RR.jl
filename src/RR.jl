@@ -3,6 +3,7 @@ module RR
     using Cxx
     using Gallium
     import Gallium: load, mapped_file, enable, disable
+    using Gallium: process_lowlevel_conditionals, Location
     using ObjFileBase
 
     function __init__()
@@ -88,10 +89,26 @@ module RR
     end
 
     function step_until_bkpt!(timeline::ReplayTimeline)
-        while disable_sigint() do
-                !icxx"$(current_session(timeline))->replay_step(rr::RUN_CONTINUE).break_status.breakpoint_hit;"
+        while true
+            exited, bp_hit = disable_sigint() do
+                res = icxx"$(current_session(timeline))->replay_step(rr::RUN_CONTINUE);"
+                (icxx"$res.status == rr::REPLAY_EXITED;",
+                 icxx"$res.break_status.breakpoint_hit;")
             end
+            exited && return false
+            bp_hit && return true
             icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+        end
+    end
+    
+    function continue!(timeline)
+        while step_until_bkpt!(timeline)
+            regs = icxx"$(current_task(current_session(timeline)))->regs();"
+            if process_lowlevel_conditionals(Location(timeline, ip(regs)), regs)
+                break
+            end
+            # Step past the breakpoint
+            single_step!(timeline)
         end
     end
 

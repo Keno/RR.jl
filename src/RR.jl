@@ -75,10 +75,11 @@ module RR
             disable(loc)
             did_disable = true
         end
-        single_step!(current_session(timeline))
+        res = single_step!(current_session(timeline))
         if did_disable
             enable(loc)
         end
+        res
     end
 
     function step_until_bkpt!(session::ReplaySession)
@@ -153,11 +154,12 @@ module RR
 
     function load{T}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
-        res = reinterpret(T,map(unsafe_load,icxx"$vm->read_mem(
+        res = Ref{T}()
+        icxx"$vm->read_bytes_helper(
             rr::remote_ptr<uint8_t>($(UInt64(ptr))),
-            $(sizeof(T)),&$ok);"))[]
+            $(sizeof(T)),(uint8_t*)&$res,&$ok);"
         ok[] || error("Failed to read memory at address $ptr")
-        res
+        res[]
     end
 
     saved_auxv(vm::pcpp"rr::ReplayTask") = map(unsafe_load,icxx"$vm->vm()->saved_auxv();")
@@ -184,12 +186,12 @@ module RR
     set_sp!(regs::RRRegisters, sp) = icxx"$regs.set_sp($(RemotePtr{Void}(sp)));"
     set_ip!(regs::RRRegisters, ip) = icxx"$regs.set_ip($(RemoteCodePtr(ip)));"
     function set_dwarf!(regs::RRRegisters, regno, val)
-        gdbregno = Gallium.X86_64.inverse_gdb[Gallium.X86_64.dwarf_numbering[regno]]
+        gdbregno = Gallium.X86_64.dwarf2gdb(regno)
         valr = Ref{UInt64}(UInt64(val))
         icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,sizeof(uintptr_t));"
     end
     function get_dwarf(regs::RRRegisters, regno)
-        gdbregno = Gallium.X86_64.inverse_gdb[Gallium.X86_64.dwarf_numbering[regno]]
+        gdbregno = Gallium.X86_64.dwarf2gdb(regno)
         buf = Ref{UInt64}(0)
         defined = Ref{Bool}()
         icxx"$regs.read_register((uint8_t*)&$buf, (rr::GdbRegister)$gdbregno, &$defined);"

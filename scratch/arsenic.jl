@@ -64,6 +64,7 @@ function update_stack!(state)
     stack[end].stacktop = !did_fixup
     state.interp = state.top_interp = Gallium.NativeStack(stack,state.top_interp.modules)
 end
+update_stack!(state::Void) = nothing
 
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:si}, command)
     RR.single_step!(timeline)
@@ -273,6 +274,7 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     if startswith(subcmd[1],"@")
         n = parse(Int, subcmd[1][2:end])
         icxx"$timeline->seek_to_mark($(mark_stack[n]));"
+        icxx"$timeline->apply_breakpoints_and_watchpoints();"
         println("We have arrived.")
         update_stack!(state)
         return true
@@ -281,20 +283,36 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     me = when()
     target = me + n
     p = Progress(n, 1, "Time travel in progress (forwards)...", 50)
+    function check_for_breakpoint(res)
+        if icxx"$res.break_status.breakpoint_hit;"
+            regs = icxx"$(current_task(current_session(timeline)))->regs();"
+            if RR.process_lowlevel_conditionals(Location(timeline, Gallium.ip(regs)), regs)
+                println("Interrupted by breakpoint.")
+                update_stack!(state)
+                return true
+            end
+        end
+        false
+    end
     while when() < target
+        # Step past any breakpoints
+        RR.single_step!(timeline)
         res = RR.step!(current_session(timeline), target)
         if icxx"$res.break_status.approaching_ticks_target;"
             break
         end
+        check_for_breakpoint(res) && return true
         icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
         now = when()
         now != me && ProgressMeter.update!(p, Int64(now - me))
     end
     while when() < target
-        res = RR.single_step!(current_session(timeline))
+        res = RR.single_step!(timeline)
+        check_for_breakpoint(res) && return true
         now = when()
         now != me && ProgressMeter.update!(p, Int64(now - me))
     end
+    icxx"$timeline->apply_breakpoints_and_watchpoints();"
     println("We have arrived.")
     update_stack!(state)
     return true

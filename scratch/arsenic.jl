@@ -296,7 +296,9 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     end
     while when() < target
         # Step past any breakpoints
-        RR.single_step!(timeline)
+        if RR.at_breakpoint(timeline)
+            RR.emulate_single_step!(timeline) || RR.single_step!(timeline)
+        end
         res = RR.step!(current_session(timeline), target)
         if icxx"$res.break_status.approaching_ticks_target;"
             break

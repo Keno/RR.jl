@@ -2,7 +2,7 @@ module RR
 
     using Cxx
     using Gallium
-    import Gallium: load, mapped_file, enable, disable
+    import Gallium: load, write_mem, mapped_file, enable, disable
     using Gallium: process_lowlevel_conditionals, Location
     using ObjFileBase
 
@@ -62,6 +62,30 @@ module RR
 
     function single_step!(session)
         icxx"$session->replay_step(rr::RUN_SINGLESTEP);"
+    end
+
+    function at_breakpoint(timeline::ReplayTimeline)
+        loc = Gallium.Location(timeline,
+            ip(icxx"$(current_task(current_session(timeline)))->regs();"))
+        haskey(Gallium.bps_at_location, loc)        
+    end
+
+    function orig_byte(task,addr)
+        icxx"""
+            auto it = $task->vm()->breakpoints.find($addr);
+            assert(it != $task->vm()->breakpoints.end());
+            it->second.overwritten_data;
+        """
+    end
+
+    function emulate_single_step!(timeline::ReplayTimeline)
+        task = current_task(current_session(timeline))
+        regs = icxx"$(task)->regs();"
+        insts = load(task, RemotePtr{UInt8}(ip(regs)), 15)
+        insts[1] = orig_byte(task, ip(regs))
+        Gallium.X86_64.instemulate!(insts, task, regs) || return false
+        icxx"$task->set_regs($regs);"
+        return true
     end
 
     function single_step!(timeline::ReplayTimeline)
@@ -160,6 +184,26 @@ module RR
             $(sizeof(T)),(uint8_t*)&$res,&$ok);"
         ok[] || error("Failed to read memory at address $ptr")
         res[]
+    end
+    
+    function write_mem{T}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T}, val::T)
+        ok = Ref{Bool}(true)
+        res = Ref{T}(val)
+        icxx"$vm->write_bytes_helper(
+            rr::remote_ptr<uint8_t>($(UInt64(ptr))),
+            $(sizeof(T)),(uint8_t*)&$res,&$ok);"
+        ok[] || error("Failed to write memory at address $ptr")
+        nothing
+    end
+
+    function load{T}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T}, n)
+        ok = Ref{Bool}(true)
+        res = Vector{T}(n)
+        icxx"$vm->read_bytes_helper(
+            rr::remote_ptr<uint8_t>($(UInt64(ptr))),
+            $(n*sizeof(T)),$(Ptr{UInt8}(pointer(res))),&$ok);"
+        ok[] || error("Failed to read memory at address $ptr")
+        res
     end
 
     saved_auxv(vm::pcpp"rr::ReplayTask") = map(unsafe_load,icxx"$vm->vm()->saved_auxv();")

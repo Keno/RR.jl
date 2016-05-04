@@ -269,6 +269,7 @@ end
 using ProgressMeter
 when(session) = UInt64(icxx"$(current_task(session))->tick_count();")
 when() = when(current_session(timeline))
+current_vm() = current_task(current_session(timeline))
 function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     subcmd = split(command)[2:end]
     if startswith(subcmd[1],"@")
@@ -297,7 +298,7 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     while when() < target
         # Step past any breakpoints
         if RR.at_breakpoint(timeline)
-            RR.emulate_single_step!(timeline) || RR.single_step!(timeline)
+            RR.emulate_single_step!(timeline, current_vm()) || RR.single_step!(timeline)
         end
         res = RR.step!(current_session(timeline), target)
         if icxx"$res.break_status.approaching_ticks_target;"

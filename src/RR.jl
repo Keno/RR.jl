@@ -15,6 +15,7 @@ module RR
             #include <ReplaySession.h>
             #include <ReplayTask.h>
             #include <ReplayTimeline.h>
+            #include <AutoRemoteSyscalls.h>
         """
     end
     __init__()
@@ -78,12 +79,13 @@ module RR
         """
     end
 
-    function emulate_single_step!(timeline::ReplayTimeline)
+    function emulate_single_step!(timeline::ReplayTimeline,
+            vm = current_task(current_session(timeline)))
         task = current_task(current_session(timeline))
         regs = icxx"$(task)->regs();"
         insts = load(task, RemotePtr{UInt8}(ip(regs)), 15)
         insts[1] = orig_byte(task, ip(regs))
-        Gallium.X86_64.instemulate!(insts, task, regs) || return false
+        Gallium.X86_64.instemulate!(insts, vm, regs) || return false
         icxx"$task->set_regs($regs);"
         return true
     end
@@ -155,6 +157,23 @@ module RR
         read_exe(current_task(session))
     end
 
+    using Gallium.Hooking: PROT_READ, PROT_WRITE
+    # Mapping remote mappings
+    function map_remote(task, mapping::cxxt"const rr::KernelMapping*")
+        fd = icxx"""
+            rr::AutoRemoteSyscalls remote($task);
+            rr::ScopedFd local_fd = remote.retrieve_fd($(mapping)->tracee_fd());
+            return dup(local_fd.get());
+        """
+        msize = icxx"$(mapping)->size();";
+        addr = ccall(:mmap,
+            Ptr{UInt8}, (Ptr{Void},Csize_t,Cint,Cint,Cint,Int64),
+            C_NULL, msize, PROT_READ | PROT_WRITE, Base.Mmap.MAP_SHARED, fd, 0)
+        systemerror("mmap",addr==Ptr{Void}(-1))
+        r = pointer_to_array(addr, (msize,), false)
+        ccall(:close, Void, (Cint,), fd)
+        r
+    end
 
     # Remote memory operations
     function Cxx.cppconvert{T}(ptr::RemotePtr{T})
@@ -167,6 +186,8 @@ module RR
         icxx"$ptr.register_value();"
     Base.convert{T}(::Type{UInt64}, ptr::cxxt"rr::remote_ptr<$T>") =
         icxx"$ptr.as_int();"
+    Base.convert{T}(::Type{RemotePtr{T}}, ptr::cxxt"rr::remote_ptr<$T>") =
+        RemotePtr{T}(UInt(ptr))
 
     typealias RRRemotePtr{T} Union{RemotePtr{T}, cxxt"rr::remote_ptr<$T>"}
     function load{T<:Cxx.CxxBuiltinTypes}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T})

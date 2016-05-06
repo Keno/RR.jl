@@ -26,7 +26,7 @@ module RR
     function Base.current_task(session::ReplaySession)
         @assert icxx"$session != 0;"
         task = icxx"$session->current_task();"
-        @assert task != 0
+        @assert Ptr{Void}(task) != C_NULL
         task
     end
 
@@ -126,6 +126,19 @@ module RR
             bp_hit && return true
             icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
         end
+    end
+    
+    function step_to_address!(timeline::ReplayTimeline, theip; disable_bps = false)
+        if disable_bps
+            icxx"$timeline->unapply_breakpoints_and_watchpoints();"
+        else
+            single_step!(timeline)
+        end
+        icxx"$(current_task(current_session(timeline)))->vm()->add_breakpoint($theip, rr::BKPT_USER);"
+        RR.step_until_bkpt!(current_session(timeline))
+        icxx"$(current_task(current_session(timeline)))->vm()->remove_breakpoint($theip, rr::BKPT_USER);"
+        disable_bps && icxx"$timeline->apply_breakpoints_and_watchpoints();"
+        nothing
     end
     
     function continue!(timeline)

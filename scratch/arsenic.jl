@@ -1,21 +1,5 @@
 using RR; using Cxx
 using RR: current_session
-session = icxx"""rr::ReplaySession::create("");"""
-timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
-session = nothing
-icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-RR.step_until_exec!(current_session(timeline))
-icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-for i = 1:2000;
-RR.step!(current_session(timeline));
-icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-end
-imageh = RR.read_exe(current_session(timeline))
-modules = Gallium.GlibcDyldModules.load_library_map(current_task(current_session(timeline)), imageh)
-did_fixup, regs = RR.fixup_RC(current_task(current_session(timeline)), icxx"$(current_task(current_session(timeline)))->regs();")
-stack = Gallium.stackwalk(regs, current_task(current_session(timeline)), modules, rich_c = true)
-stack[end].stacktop = !did_fixup
-
 cxx"""
 #include <cxxabi.h>
 #include "llvm/MC/SubtargetFeature.h"
@@ -31,13 +15,54 @@ cxx"""
 using namespace llvm;
 """
 
-
 include(Pkg.dir("RR","scratch","disassembler.jl"))
 
 using DWARF.CallFrameInfo
 using Gallium.Unwinder: find_fde
 using ObjFileBase: handle
 using Gallium: Location
+
+session = icxx"""rr::ReplaySession::create("");"""
+timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
+session = nothing
+icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+RR.step_until_exec!(current_session(timeline))
+current_vm(timeline) = current_task(current_session(timeline))
+current_vm() = current_vm(timeline)
+regs = icxx"$(current_vm())->regs();"
+rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
+icxx"""
+rr::AutoRemoteSyscalls remote($(current_vm()));
+rr::Session::make_private_shared(remote,$(current_vm())->vm()->mapping_of($rsp));
+"""
+icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+import Gallium.GlibcDyldModules: compute_entry_ptr
+task = current_task(current_session(timeline))
+entrypt = compute_entry_ptr(RR.saved_auxv(task))
+icxx"$timeline->add_breakpoint($task, $entrypt);"
+RR.step_until_bkpt!(timeline)
+icxx"$timeline->remove_breakpoint($task, $entrypt);"
+icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+imageh = RR.read_exe(current_session(timeline))
+modules = Gallium.GlibcDyldModules.load_library_map(current_task(current_session(timeline)), imageh)
+
+function compute_remap()
+    t = current_task(current_session(timeline))
+    regs = icxx"$t->regs();"
+    rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
+    map = icxx"""
+    $t->vm()->mapping_of($rsp);
+    """
+    @assert icxx"$map.local_addr;" != C_NULL
+    Gallium.Remap[Gallium.Remap(icxx"$map.map.start();",icxx"$map.map.size();",
+    pointer_to_array(Ptr{UInt8}(icxx"$map.local_addr;"), (icxx"$map.map.size();",), false))]
+end
+#=
+stack_remap = compute_remap()
+
+current_vm(timeline) = Gallium.TransparentRemap(current_task(current_session(timeline)), stack_remap::Vector{Gallium.Remap})
+current_vm() = current_vm(timeline)
+=#
 
 function get_insts(stack)
     stack = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
@@ -58,11 +83,18 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:disas}, command)
     return false
 end
 
+function compute_stack(modules)
+    task = current_task(current_session(timeline));
+    did_fixup, regs = RR.fixup_RC(task, icxx"$task->regs();")
+    stack, RCs = Gallium.stackwalk(regs, current_task(current_session(timeline)), modules, rich_c = true, collectRCs = true)
+    if length(stack) != 0
+        stack[end].stacktop = !did_fixup
+    end
+    Gallium.NativeStack(stack,RCs,modules)
+end
+
 function update_stack!(state)
-    did_fixup, regs = RR.fixup_RC(current_task(current_session(timeline)), icxx"$(current_task(current_session(timeline)))->regs();")
-    stack = Gallium.stackwalk(regs, current_task(current_session(timeline)), modules, rich_c = true)
-    stack[end].stacktop = !did_fixup
-    state.interp = state.top_interp = Gallium.NativeStack(stack,state.top_interp.modules)
+    state.interp = state.top_interp = compute_stack(state.top_interp.modules)
 end
 update_stack!(state::Void) = nothing
 
@@ -177,11 +209,15 @@ function ASTInterpreter.print_status(x::Gallium.CStackFrame; kwargs...)
     print("Stopped in function ")
     println(demangle(Gallium.Unwinder.symbolicate(modules, UInt64(x.ip))))
     if x.line != 0
-        # Print file here
-    else
-        base, loc, insts = get_insts(x)
-        disasm_around_ip(STDOUT, insts, UInt64(x.ip-loc-base-(x.stacktop?0:1)); ipbase=base+loc)
+        code = ASTInterpreter.readfileorhist(x.file)
+        if code !== nothing
+            ASTInterpreter.print_sourcecode(
+                code, x.line, x.declfile, x.declline)
+            return
+        end
     end
+    base, loc, insts = get_insts(x)
+    disasm_around_ip(STDOUT, insts, UInt64(x.ip-loc-base-(x.stacktop?0:1)); ipbase=base+loc)
 end
 
 function ASTInterpreter.print_frame(io, num, x::Gallium.CStackFrame)
@@ -269,13 +305,13 @@ end
 using ProgressMeter
 when(session) = UInt64(icxx"$(current_task(session))->tick_count();")
 when() = when(current_session(timeline))
-current_vm() = current_task(current_session(timeline))
 function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     subcmd = split(command)[2:end]
     if startswith(subcmd[1],"@")
         n = parse(Int, subcmd[1][2:end])
         icxx"$timeline->seek_to_mark($(mark_stack[n]));"
         icxx"$timeline->apply_breakpoints_and_watchpoints();"
+        global stack_remap = compute_remap()
         println("We have arrived.")
         update_stack!(state)
         return true
@@ -322,9 +358,13 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
 end
 
 function Gallium.breakpoint(timeline::RR.ReplayTimeline, fname::Symbol)
-    h, base, sym = Gallium.lookup_sym(modules, fname)
-    addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
-    Gallium.breakpoint(timeline, addr)
+    syms = Gallium.lookup_syms(modules, fname)
+    bp = Gallium.Breakpoint()
+    for (h, base, sym) in syms
+        addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
+        Gallium.add_location(bp, Gallium.Location(timeline, addr))
+    end
+    bp
 end
 
 function Gallium.breakpoint(timeline::RR.ReplayTimeline, addr)
@@ -360,4 +400,30 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:c}, command)
     return true
 end
 
-ASTInterpreter.RunDebugREPL(Gallium.NativeStack(stack, modules))
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.CStackFrame,Gallium.NativeStack}, ::Val{:reg}, command)
+    ns = state.top_interp
+    @assert isa(ns, Gallium.NativeStack)
+    RC = ns.RCs[end-(state.level-1)]
+    regname = Symbol(split(command,' ')[2])
+    if !haskey(Gallium.X86_64.inverse_dwarf, regname)
+        print_with_color(:red, STDOUT, "No such register\n")
+        return false
+    end
+    show(UInt(Gallium.get_dwarf(RC, Gallium.X86_64.inverse_dwarf[regname])))
+    println(); println()
+    return false
+end
+
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.CStackFrame,Gallium.NativeStack}, ::Val{:finish}, command)
+    ns = state.top_interp
+    @assert isa(ns, Gallium.NativeStack)
+    parentRC = ns.RCs[end-(state.level)]
+    theip = Gallium.ip(parentRC)
+    RR.step_to_address!(timeline, theip; disable_bps = true)
+    update_stack!(state)
+    return true
+end
+
+
+RunDebugREPL() = ASTInterpreter.RunDebugREPL(compute_stack(modules))
+RunDebugREPL()

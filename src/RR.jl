@@ -16,6 +16,7 @@ module RR
             #include <ReplayTask.h>
             #include <ReplayTimeline.h>
             #include <AutoRemoteSyscalls.h>
+            #include <algorithm>
         """
     end
     __init__()
@@ -268,7 +269,7 @@ module RR
         valr = Ref{UInt64}(UInt64(val))
         icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,sizeof(uintptr_t));"
     end
-    function get_dwarf(regs::RRRegisters, regno)
+    function get_dwarf(regs::RRRegisters, regno::Integer)
         gdbregno = Gallium.X86_64.dwarf2gdb(regno)
         buf = Ref{UInt64}(0)
         defined = Ref{Bool}()
@@ -292,6 +293,29 @@ module RR
             did_fixup = true
         end
         did_fixup, RC
+    end
+    
+    when(session::ReplaySession) = UInt64(icxx"$(current_task(session))->tick_count();")
+    when(timeline::ReplayTimeline) = when(current_session(timeline))
+    
+    function count_total_ticks(reader)
+        icxx"""
+            ssize_t nticks = 0;
+            $reader.rewind();
+            rr::TraceFrame frame;
+            while (true) {
+                rr::TraceFrame next_frame = $reader.read_frame();
+                if ($reader.at_end())
+                    break;
+                frame = next_frame;
+                nticks = std::max(nticks, frame.ticks());
+            }
+            nticks;
+        """
+    end
+    function count_total_ticks(timeline::ReplayTimeline)
+        session = current_session(timeline)
+        count_total_ticks(icxx"rr::TraceReader{$session->trace_reader()};")
     end
 
 end # module

@@ -22,29 +22,34 @@ using Gallium.Unwinder: find_fde
 using ObjFileBase: handle
 using Gallium: Location
 
-session = icxx"""rr::ReplaySession::create("");"""
-timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
-session = nothing
-icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-RR.step_until_exec!(current_session(timeline))
+import Gallium.GlibcDyldModules: compute_entry_ptr
+
 current_vm(timeline) = current_task(current_session(timeline))
 current_vm() = current_vm(timeline)
-regs = icxx"$(current_vm())->regs();"
-rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
-icxx"""
-rr::AutoRemoteSyscalls remote($(current_vm()));
-rr::Session::make_private_shared(remote,$(current_vm())->vm()->mapping_of($rsp));
-"""
-icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-import Gallium.GlibcDyldModules: compute_entry_ptr
-task = current_task(current_session(timeline))
-entrypt = compute_entry_ptr(RR.saved_auxv(task))
-icxx"$timeline->add_breakpoint($task, $entrypt);"
-RR.step_until_bkpt!(timeline)
-icxx"$timeline->remove_breakpoint($task, $entrypt);"
-icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-imageh = RR.read_exe(current_session(timeline))
-modules = Gallium.GlibcDyldModules.load_library_map(current_task(current_session(timeline)), imageh)
+function replay(trace_dir="")
+    session = icxx"""rr::ReplaySession::create($(pointer(trace_dir)));"""
+    timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
+    session = nothing
+    icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+    RR.step_until_exec!(current_session(timeline))
+    regs = icxx"$(current_vm(timeline))->regs();"
+    rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
+    icxx"""
+    rr::AutoRemoteSyscalls remote($(current_vm(timeline)));
+    rr::Session::make_private_shared(remote,$(current_vm(timeline))->vm()->mapping_of($rsp));
+    """
+    icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+    task = current_task(current_session(timeline))
+    entrypt = compute_entry_ptr(RR.saved_auxv(task))
+    icxx"$timeline->add_breakpoint($task, $entrypt);"
+    RR.step_until_bkpt!(timeline)
+    icxx"$timeline->remove_breakpoint($task, $entrypt);"
+    icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+    imageh = RR.read_exe(current_session(timeline))
+    modules = Gallium.GlibcDyldModules.load_library_map(current_task(current_session(timeline)), imageh)
+
+    timeline, modules
+end
 
 function compute_remap()
     t = current_task(current_session(timeline))
@@ -229,21 +234,6 @@ function ASTInterpreter.print_frame(io, num, x::Gallium.CStackFrame)
     println(io)
 end
 
-function count_total_ticks(reader)
-    icxx"""
-        $reader.rewind();
-        rr::TraceFrame frame;
-        while (true) {
-            rr::TraceFrame next_frame = $reader.read_frame();
-            if ($reader.at_end())
-                break;
-            frame = next_frame;
-        }
-        frame.ticks();
-    """
-end
-total_ticks = count_total_ticks(icxx"rr::TraceReader{$(current_session(timeline))->trace_reader()};")
-
 using TerminalExtensions; using Gadfly; using Colors
 const repl_theme = Gadfly.Theme(
     panel_fill=colorant"black", default_color=colorant"orange", major_label_color=colorant"white",
@@ -275,23 +265,44 @@ function collect_mark_ticks(marks)
     ticks
 end
 
-function ASTInterpreter.execute_command(state, stack, ::Val{:timeline}, command)
-    me = UInt64(icxx"$(current_task(current_session(timeline)))->tick_count();")
-    ticks = []
-    contains(command, "internal") && (ticks = collect_mark_ticks())
-    explicit_ticks = collect_mark_ticks(mark_stack)
-    colors = [colorant"orange",colorant"green",colorant"purple"]
-    (length(ticks) != 0) && unshift!(colors, colorant"blue")
+immutable TimelineEvent
+    t::Int
+    label::Symbol
+end
+
+start_time(timeline) = TimelineEvent(0, :start)
+end_time(timeline) = TimelineEvent(RR.count_total_ticks(timeline), :end)
+const timeline_default_colors = [colorant"orange",colorant"green",colorant"purple",colorant"blue"]
+function timeline_layers(events; timeline_id = 0, pointfilterset=[])
+    y = [timeline_id for _ in 1:length(events)]
+    filterids = find(x->!(x.label in pointfilterset),events)
+    [layer(x=map(x->x.t, events[filterids]),
+        y=y[filterids],
+        color = map(x->x.label, events[filterids]), Geom.point),
+        layer(x=map(x->x.t, events),
+            y=y, Geom.line)]
+end
+
+function plot_timeline(events, colors = timeline_default_colors; timeline_id = 0)
     display(
-    plot(x=[ticks...,0,me,23549392659,explicit_ticks...],
-        y=[zeros(Int,length(ticks))...,0,0,0,zeros(Int,length(explicit_ticks))...],
-        color=[[:internal_tick for _ in 1:length(ticks)]...,:end,:me,:end,
-            [:explicit_tick for _ in 1:length(explicit_ticks)]...],
-        Geom.point,Geom.line,repl_theme,Guide.xlabel("Time"),
+    plot(timeline_layers(events, timeline_id = timeline_id)...;
+        repl_theme,Guide.xlabel("Time"),
         Guide.ylabel("Timeline"),
         Scale.color_discrete_manual(colors...))
     )
-    println()
+end
+
+function ASTInterpreter.execute_command(state, stack, ::Val{:timeline}, command)
+    me = TimelineEvent(UInt64(icxx"$(current_task(current_session(timeline)))->tick_count();"),
+        :me)
+    ticks = []
+    contains(command, "internal") && (ticks = collect_mark_ticks())
+    ticks = [TimelineEvent(t, :internal_tick) for t in ticks]
+    explicit_ticks = [TimelineEvent(t, :explicit_tick) for t in collect_mark_ticks(mark_stack)]
+    colors = [colorant"orange",colorant"green",colorant"purple"]
+    (length(ticks) != 0) && unshift!(colors, colorant"blue")
+    display(plot_timeline([ticks..., start_time(timeline),
+        me, end_time(timeline), explicit_ticks], colors))
     println("The timeline is intact.")
     return false
 end
@@ -303,7 +314,7 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:mark}, command)
 end
 
 using ProgressMeter
-when(session) = UInt64(icxx"$(current_task(session))->tick_count();")
+import RR: when
 when() = when(current_session(timeline))
 function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     subcmd = split(command)[2:end]
@@ -426,4 +437,3 @@ end
 
 
 RunDebugREPL() = ASTInterpreter.RunDebugREPL(compute_stack(modules))
-RunDebugREPL()

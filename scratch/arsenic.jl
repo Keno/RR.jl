@@ -34,10 +34,10 @@ function replay(trace_dir="")
     RR.step_until_exec!(current_session(timeline))
     regs = icxx"$(current_vm(timeline))->regs();"
     rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
-    icxx"""
+    #=icxx"""
     rr::AutoRemoteSyscalls remote($(current_vm(timeline)));
     rr::Session::make_private_shared(remote,$(current_vm(timeline))->vm()->mapping_of($rsp));
-    """
+    """=#
     icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
     task = current_task(current_session(timeline))
     entrypt = compute_entry_ptr(RR.saved_auxv(task))
@@ -114,6 +114,63 @@ function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,
     update_stack!(state)
     return true
 end
+
+"""
+Attempt to reverse step until the entry to the current function.
+"""
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:rf}, command)
+    # Algorithm:
+    # 1. Determine the location of the function entry point.
+    # 2. Determine how to compute the CFA, both here and at the function entry
+    #    point.
+    # 3. Continue unless the CFA matches
+    
+    # Determine module
+    stack = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
+    mod, base, ip = Gallium.modbaseip_for_stack(state, stack)
+    modrel = UInt(ip - base)
+    loc, fde = Gallium.Unwinder.find_fde(mod, modrel)
+    
+    # Compute CFI
+    ciecache = nothing
+    isa(mod, Module) && (ciecache = mod.ciecache)
+    cie::DWARF.CallFrameInfo.CIE, ccoff = realize_cieoff(fde, ciecache)
+    target_delta = modrel - loc
+    
+    entry_rs = CallFrameInfo.evaluate_program(fde, UInt(0), cie = cie, ciecache = ciecache, ccoff=ccoff)
+    here_rs =  CallFrameInfo.evaluate_program(fde, target_delta, cie = cie, ciecache = ciecache, ccoff=ccoff)
+
+    # Compute the CFA here
+    regs = icxx"$(current_task(current_session(timeline)))->regs();"
+    here_cfa = Gallium.Unwinder.compute_cfa_addr(current_task(current_session(timeline)), regs, here_rs)
+    here_rsp = Gallium.get_dwarf(regs, :rsp)
+    
+    # Set a breakpoint at function entry
+    bp = Gallium.breakpoint(timeline, base + loc)
+    
+    # Reverse continue until the breakpoint is hit at a matching CFA, or until
+    # we're at a breakpoint higher up the stack (which would imply that we missed it)
+    while true
+        RR.reverse_continue!(timeline)
+        # TODO: Check that we're at the right breakpoint
+        new_regs = icxx"$(current_task(current_session(timeline)))->regs();"
+        new_cfa = Gallium.Unwinder.compute_cfa_addr(current_task(current_session(timeline)), new_regs, entry_rs)
+        if here_cfa == new_cfa
+            break
+        elseif Gallium.get_dwarf(new_regs, :rsp) > here_rsp
+            println("WARNING: May have missed function call.")
+            break
+        end
+    end
+    Gallium.disable(bp)
+    
+    # Step once more to get out of the function
+    RR.reverse_single_step!(current_session(timeline),current_task(current_session(timeline)),timeline)
+    
+    update_stack!(state)
+    return true
+end
+
 
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:ip}, command)
     x = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
@@ -212,7 +269,8 @@ end
 
 function ASTInterpreter.print_status(x::Gallium.CStackFrame; kwargs...)
     print("Stopped in function ")
-    println(demangle(Gallium.Unwinder.symbolicate(modules, UInt64(x.ip))))
+    found, symb = symbolicate_frame(modules, x)
+    println(symb)
     if x.line != 0
         code = ASTInterpreter.readfileorhist(x.file)
         if code !== nothing
@@ -221,13 +279,34 @@ function ASTInterpreter.print_status(x::Gallium.CStackFrame; kwargs...)
             return
         end
     end
-    base, loc, insts = get_insts(x)
-    disasm_around_ip(STDOUT, insts, UInt64(x.ip-loc-base-(x.stacktop?0:1)); ipbase=base+loc)
+    ipoffset = 0
+    ipbase = x.ip
+    if found
+        base, loc, insts = get_insts(x)
+        ipbase = base+loc
+        ipoffset = UInt64(x.ip-loc-base-(x.stacktop?0:1))
+    else
+        insts = Gallium.load(current_vm(timeline), Gallium.RemotePtr{UInt8}(x.ip), 40)
+    end
+    disasm_around_ip(STDOUT, insts, ipoffset; ipbase=ipbase)
+end
+
+function symbolicate_frame(modules, x)
+    found = false
+    symb = "Unknown Function"
+    try
+        symb = demangle(Gallium.Unwinder.symbolicate(modules, UInt64(x.ip)))
+        found = true
+    catch err
+        (!isa(err, ErrorException) || !contains(err.msg, "found")) && rethrow(err)
+    end
+    found, symb
 end
 
 function ASTInterpreter.print_frame(io, num, x::Gallium.CStackFrame)
     print(io, "[$num] ")
-    print(io, demangle(Gallium.Unwinder.symbolicate(modules, UInt64(x.ip))), " ")
+    found, symb = symbolicate_frame(modules, x)
+    print(io, symb, " ")
     if x.line != 0
       print(io, " at ",x.file,":",x.line)
     end
@@ -285,7 +364,7 @@ end
 
 function plot_timeline(events, colors = timeline_default_colors; timeline_id = 0)
     display(
-    plot(timeline_layers(events, timeline_id = timeline_id)...;
+    plot(timeline_layers(events, timeline_id = timeline_id)...,
         repl_theme,Guide.xlabel("Time"),
         Guide.ylabel("Timeline"),
         Scale.color_discrete_manual(colors...))
@@ -301,17 +380,51 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timeline}, command)
     explicit_ticks = [TimelineEvent(t, :explicit_tick) for t in collect_mark_ticks(mark_stack)]
     colors = [colorant"orange",colorant"green",colorant"purple"]
     (length(ticks) != 0) && unshift!(colors, colorant"blue")
-    display(plot_timeline([ticks..., start_time(timeline),
-        me, end_time(timeline), explicit_ticks], colors))
+    display(plot_timeline([ticks; start_time(timeline);
+        me; end_time(timeline); explicit_ticks], colors))
     println("The timeline is intact.")
     return false
 end
 
-const mark_stack = Any[]
+immutable AnnotatedMark
+    mark
+    annotation::String
+end
+
+const mark_stack = AnnotatedMark[]
 function ASTInterpreter.execute_command(state, stack, ::Val{:mark}, command)
-    push!(mark_stack,icxx"$timeline->mark();")
+    push!(mark_stack,AnnotatedMark(icxx"$timeline->mark();",command[5:end]))
     return false
 end
+
+using JLD
+"""
+List all marks.
+"""
+function ASTInterpreter.execute_command(state, stack, ::Val{:marks}, command)
+    subcmds = split(command," ")[2:end]
+    if isempty(subcmds) || subcmds[1] == "list"
+        for (i,mark) in enumerate(mark_stack)
+            println("[$i] Mark (",mark.annotation,")")
+        end
+    elseif subcmds[1] == "save"
+        annotations = map(x->x.annotation,mark_stack)
+        marks = map(x->reinterpret(UInt8,[icxx"$(x.mark)->ptr.proto".data]),mark_stack)
+        @save "marks.jld" annotations marks
+    elseif subcmds[1] == "load"
+        @load "marks.jld" annotations marks
+        pms = map(x->cxxt"rr::ReplayTimeline::ProtoMark"{312}(reinterpret(NTuple{312,UInt8},x)[]),marks)
+        println("Recreating marks. One moment please...")
+        for (annotation, pm) in zip(annotations, pms)
+            RR.seek(timeline, pm)
+            push!(mark_stack,AnnotatedMark(icxx"$timeline->mark();",annotation))
+        end
+    else
+        print_with_color(:red, "Unknown subcommand\n")
+    end
+    return false
+end
+
 
 using ProgressMeter
 import RR: when
@@ -320,9 +433,9 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
     subcmd = split(command)[2:end]
     if startswith(subcmd[1],"@")
         n = parse(Int, subcmd[1][2:end])
-        icxx"$timeline->seek_to_mark($(mark_stack[n]));"
+        icxx"$timeline->seek_to_mark($(mark_stack[n].mark));"
         icxx"$timeline->apply_breakpoints_and_watchpoints();"
-        global stack_remap = compute_remap()
+        #global stack_remap = compute_remap()
         println("We have arrived.")
         update_stack!(state)
         return true

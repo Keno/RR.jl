@@ -7,12 +7,13 @@ module RR
     using ObjFileBase
 
     function __init__()
-        Libdl.dlopen(joinpath(ENV["HOME"],"rr-build/lib/librrlib.so"),
+        Libdl.dlopen(joinpath(ENV["HOME"],"rr-vanilla-build/lib/librr.so"),
             Libdl.RTLD_GLOBAL)
-        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr/src"), kind = C_System)
-        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr-build"), kind = C_System)
+        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr-vanilla/src"), kind = C_System)
+        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr-vanilla-build"), kind = C_System)
         cxx"""
-            #include <ReplaySession.h>
+            #include <RecordSession.h>
+            #include <RecordTask.h>
             #include <ReplayTask.h>
             #include <ReplayTimeline.h>
             #include <AutoRemoteSyscalls.h>
@@ -22,7 +23,9 @@ module RR
     __init__()
 
     const ReplaySession = Union{cxxt"rr::ReplaySession::shr_ptr",pcpp"rr::ReplaySession"}
+    const RecordSession = Union{cxxt"rr::RecordSession::shr_ptr",pcpp"rr::RecordSession"}
     const ReplayTimeline = Union{pcpp"rr::ReplayTimeline"}
+    const Session = Union{ReplaySession, RecordSession}
 
     function Base.current_task(session::ReplaySession)
         @assert icxx"$session != 0;"
@@ -30,8 +33,16 @@ module RR
         @assert Ptr{Void}(task) != C_NULL
         task
     end
+    
+    function Base.current_task(session::RecordSession)
+        @assert icxx"$session != 0;"
+        task = icxx"$session->scheduler().current();"
+        @assert Ptr{Void}(task) != C_NULL
+        task
+    end
 
     current_session(timeline::ReplayTimeline) = icxx"&$timeline->current_session();"
+    current_session(session::Session) = session
 
     function step_until_exec!(session)
         while !icxx"$session->done_initial_exec();"
@@ -39,15 +50,31 @@ module RR
         end
     end
 
-    function step!(session)
+    function step!(session::ReplaySession)
         icxx"$session->replay_step(rr::RUN_CONTINUE);"
     end
+    
+    function step!(session::RecordSession)
+        icxx"$session->record_step();"
+    end
 
-    function step!(session, target)
+
+    function step!(session::ReplaySession, target)
         icxx"""
             rr::ReplaySession::StepConstraints c(rr::RUN_CONTINUE);
             c.ticks_target = $target;
             $session->replay_step(c);
+        """
+    end
+
+    function reverse_continue!(timeline)
+        icxx"""
+        auto stop_filter = [&](rr::ReplayTask* t) -> bool {
+            return true;
+        };
+        auto interrupt_check = [&]() { return false; };
+        $timeline->reverse_continue(
+            stop_filter, interrupt_check);
         """
     end
 
@@ -61,8 +88,10 @@ module RR
             $task->tuid(), $task->tick_count(), stop_filter, interrupt_check);
         """
     end
+    reverse_single_step!(timeline) = reverse_single_step!(current_session(timeline),
+        current_task(current_session(timeline)), timeline)
 
-    function single_step!(session)
+    function single_step!(session::ReplaySession)
         icxx"$session->replay_step(rr::RUN_SINGLESTEP);"
     end
 
@@ -115,13 +144,22 @@ module RR
             end
         end
     end
+    
+    # We consider the last thread exit to be an implicit breakpoint
+    function is_last_thread_exit(status)
+        icxx"$status.task_exit && $status.task->task_group()->task_set().size() == 1;"
+    end
+    
+    is_break_sig(status) = icxx"$status.signal == 11;" || icxx"$status.signal == 4;"
 
     function step_until_bkpt!(timeline::ReplayTimeline)
         while true
             exited, bp_hit = disable_sigint() do
                 res = icxx"$(current_session(timeline))->replay_step(rr::RUN_CONTINUE);"
                 (icxx"$res.status == rr::REPLAY_EXITED;",
-                 icxx"$res.break_status.breakpoint_hit;")
+                 icxx"$res.break_status.breakpoint_hit;" ||
+                 is_last_thread_exit(icxx"$res.break_status;") ||
+                 is_break_sig(icxx"$res.break_status;"))
             end
             exited && return false
             bp_hit && return true
@@ -167,7 +205,7 @@ module RR
         readmeta(IOBuffer(open(read,bytestring(icxx"$task->vm()->exe_image();"))))
     end
 
-    function read_exe(session::ReplaySession)
+    function read_exe(session::Session)
         read_exe(current_task(session))
     end
 
@@ -204,14 +242,14 @@ module RR
         RemotePtr{T}(UInt(ptr))
 
     typealias RRRemotePtr{T} Union{RemotePtr{T}, cxxt"rr::remote_ptr<$T>"}
-    function load{T<:Cxx.CxxBuiltinTypes}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T})
+    function load{T<:Cxx.CxxBuiltinTypes}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
         res = icxx"$vm->read_mem($ptr,&$ok);"
         ok[] || error("Failed to read memory at address $ptr")
         res
     end
 
-    function load{T}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T})
+    function load{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
         res = Ref{T}()
         icxx"$vm->read_bytes_helper(
@@ -221,7 +259,7 @@ module RR
         res[]
     end
     
-    function write_mem{T}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T}, val::T)
+    function write_mem{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T}, val::T)
         ok = Ref{Bool}(true)
         res = Ref{T}(val)
         icxx"$vm->write_bytes_helper(
@@ -231,7 +269,7 @@ module RR
         nothing
     end
 
-    function load{T}(vm::pcpp"rr::ReplayTask", ptr::RRRemotePtr{T}, n)
+    function load{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T}, n)
         ok = Ref{Bool}(true)
         res = Vector{T}(n)
         icxx"$vm->read_bytes_helper(
@@ -316,6 +354,14 @@ module RR
     function count_total_ticks(timeline::ReplayTimeline)
         session = current_session(timeline)
         count_total_ticks(icxx"rr::TraceReader{$session->trace_reader()};")
+    end
+    
+    function proto_mark(timeline)
+        icxx"$timeline->proto_mark();"
+    end
+    
+    function seek(timeline, mark::cxxt"rr::ReplayTimeline::ProtoMark")
+        icxx"$timeline->seek_to_proto_mark($mark);"
     end
 
 end # module

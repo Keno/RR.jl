@@ -2,7 +2,7 @@ module RR
 
     using Cxx
     using Gallium
-    import Gallium: load, write_mem, mapped_file, enable, disable
+    import Gallium: load, store!, mapped_file, enable, disable
     using Gallium: process_lowlevel_conditionals, Location
     using ObjFileBase
 
@@ -202,7 +202,7 @@ module RR
 
     function read_exe(task)
         @assert task != C_NULL
-        readmeta(IOBuffer(open(read,bytestring(icxx"$task->vm()->exe_image();"))))
+        readmeta(IOBuffer(open(read,Cxx.unsafe_string(icxx"$task->vm()->exe_image();"))))
     end
 
     function read_exe(session::Session)
@@ -259,7 +259,7 @@ module RR
         res[]
     end
     
-    function write_mem{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T}, val::T)
+    function store!{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask",pcpp"rr::Task"}, ptr::RRRemotePtr{T}, val::T)
         ok = Ref{Bool}(true)
         res = Ref{T}(val)
         icxx"$vm->write_bytes_helper(
@@ -283,7 +283,7 @@ module RR
 
     function mapped_file(vm::pcpp"rr::ReplayTask", ptr)
         @assert icxx"$vm->vm()->has_mapping($ptr);"
-        bytestring(icxx"$vm->vm()->mapping_of($ptr).map.fsname();")
+        Cxx.unsafe_string(icxx"$vm->vm()->mapping_of($ptr).map.fsname();")
     end
 
     import Gallium.GlibcDyldModules: load_library_map, compute_entry_ptr
@@ -302,7 +302,7 @@ module RR
     invalidate_regs!(regs::RRRegisters) = nothing # RR does not track validity
     set_sp!(regs::RRRegisters, sp) = icxx"$regs.set_sp($(RemotePtr{Void}(sp)));"
     set_ip!(regs::RRRegisters, ip) = icxx"$regs.set_ip($(RemoteCodePtr(ip)));"
-    function set_dwarf!(regs::RRRegisters, regno, val)
+    function set_dwarf!(regs::RRRegisters, regno::Integer, val)
         gdbregno = Gallium.X86_64.dwarf2gdb(regno)
         valr = Ref{UInt64}(UInt64(val))
         icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,sizeof(uintptr_t));"

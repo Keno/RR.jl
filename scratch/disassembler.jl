@@ -113,7 +113,7 @@ end
 function Base.show(io::IO, Inst::pcpp"llvm::MCInst")
   ctx = isa(io,IOContext) && haskey(io, :disasmctx) ?
     get(io, :disasmctx, nothing) : DisAsmContext()
-  print(io,bytestring(icxx"""
+  print(io,String(icxx"""
   std::string O;
   raw_string_ostream OS(O);
   ($(ctx.MIP))->printInst(($Inst), OS, "", *$(ctx.MSTI));

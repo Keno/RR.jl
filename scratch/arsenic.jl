@@ -73,10 +73,20 @@ function get_insts(stack)
     stack = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
     base, mod = Gallium.find_module(modules, UInt(stack.ip))
     modrel = UInt(UInt(stack.ip)-base)
-    loc, fde = find_fde(mod, modrel)
-    cie = realize_cie(fde)
-    nbytes = UInt(CallFrameInfo.fde_range(fde, cie))
-    seek(handle(mod), loc)
+    if isnull(mod.xpdata)
+        loc, fde = find_fde(mod, modrel)
+        seekloc = loc
+        cie = realize_cie(fde)
+        nbytes = UInt(CallFrameInfo.fde_range(fde, cie))
+    else
+        entry = Gallium.Unwinder.find_seh_entry(mod, modrel)
+        loc = entry.start
+        # Need to translate from virtual to file addresses. Hardcode 0xa00 for
+        # now.
+        seekloc = loc - 0xa00
+        nbytes = entry.stop - entry.start
+    end
+    seek(handle(mod), seekloc)
     insts = read(handle(mod), UInt8, nbytes)
     base, loc, insts
 end
@@ -339,7 +349,7 @@ end
 function collect_mark_ticks(marks)
     ticks = UInt[]
     for mark in marks
-        push!(ticks, icxx"$mark.ptr->key.ticks;")
+        push!(ticks, icxx"$(mark.mark).ptr->proto.key.ticks;")
     end
     ticks
 end
@@ -467,13 +477,13 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
         check_for_breakpoint(res) && return true
         icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
         now = when()
-        now != me && ProgressMeter.update!(p, Int64(now - me))
+        now != me && ProgressMeter.update!(p, Int64(now) - Int(me))
     end
     while when() < target
         res = RR.single_step!(timeline)
         check_for_breakpoint(res) && return true
         now = when()
-        now != me && ProgressMeter.update!(p, Int64(now - me))
+        now != me && ProgressMeter.update!(p, Int64(now) - Int(me))
     end
     icxx"$timeline->apply_breakpoints_and_watchpoints();"
     println("We have arrived.")
@@ -546,6 +556,47 @@ function ASTInterpreter.execute_command(state, stack::Union{Gallium.CStackFrame,
     RR.step_to_address!(timeline, theip; disable_bps = true)
     update_stack!(state)
     return true
+end
+
+function prepare_remote_execution(timeline)
+    session = icxx"$(current_session(timeline))->clone_diversion();"
+end
+
+
+function run_jl_(timeline, val)
+    diversion = prepare_remote_execution(timeline)
+    
+    # Pick an arbitrary task to run our expression
+    task = icxx"$diversion->tasks().begin()->second;"
+    regs = icxx"$task->regs();"
+    
+    # Find the jl_ ip
+    (h, base, sym)  = Gallium.lookup_sym(modules, :jl_)
+    addr = base + ObjFileBase.deref(sym).st_value
+    
+    # Set up the call frame
+    Gallium.set_ip!(regs, addr)
+    new_rsp = Gallium.get_dwarf(regs, :rsp)-250
+    new_rsp -= (new_rsp % 16)
+    Gallium.set_dwarf!(regs, :rsp, new_rsp)
+    
+    # Set return address to 0
+    Gallium.store!(task, Gallium.RemotePtr{UInt64}(new_rsp), UInt64(0))
+    
+    # Set up arguments
+    Gallium.set_dwarf!(regs, :rsi, val)
+
+    # Writes registers back to task
+    icxx"$task->set_regs($regs);"
+    
+    # Alright, let's go
+    while true
+        res = icxx"$diversion->diversion_step($task);"
+        if icxx"$res.status == rr::DiversionSession::DIVERSION_CONTINUE;" ||
+            icxx"$res.break_status.signal != 0;"
+            break
+        end
+    end
 end
 
 

@@ -16,9 +16,9 @@ task = current_task(current_session(timeline))
 h,base,sym = Gallium.lookup_sym(timeline, modules, :malloc)
 hook_addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
 
-#base_ticks_ptr = icxx"""
-#    REMOTE_PTR_FIELD($(current_task(current_session(timeline)))->preload_globals,base_ticks);
-#"""
+base_ticks_ptr = icxx"""
+    REMOTE_PTR_FIELD($(current_task(current_session(timeline)))->preload_globals,base_ticks);
+"""
 
 # Ok, now allocate space (2GB) for the data buffer
 data_buffer_start = 0x70001000
@@ -117,7 +117,6 @@ function parseIR(str)
     """
 end
 
-base_ticks_ptr = 0xdeadbeef
 mod = parseIR("""
 module asm "
 .text
@@ -196,14 +195,6 @@ remote.infallible_mmap_syscall($buffer_start_addr, 0x1000, PROT_READ |
 """
 =#
 
-hook_template = Gallium.Hooking.hook_asm_template(UInt64(hook_addr),
-    UInt64(buffer_start_addr); call = false)
-orig_bytes = Gallium.load(task, RemotePtr{UInt8}(hook_addr), length(hook_template)+15)
-nbytes = Gallium.Hooking.determine_nbytes_to_replace(length(hook_template), orig_bytes)
-
-@show nbytes
-
-
 code = [
     0x50; # pushq %rax
     0x51; # pushq %rcx
@@ -249,7 +240,77 @@ code = [
     0x58; # popq %rax
 ]
 
+TargetClang = Cxx.new_clang_instance(false)
+let __current_compiler__ = TargetClang
+    cxx"""
+    #include <stdint.h>
+    extern "C" {
+        __attribute__((naked)) void malloc_hook3() {
+            asm ("pushq %r11\n" // extra alignment
+                 "callq malloc_hook2\n"
+                 "popq %r11\n"
+                 "nopl 0L(%rax,%rax,1)\n"
+                 "nopl 0L(%rax,%rax,1)\n"
+                 "nopl 0L(%rax,%rax,1)\n"
+                 "nopl 0L(%rax,%rax,1)\n"
+                 "int \$3");
+        }
+        
+        static inline uint64_t native_read_pmc(uint32_t counter) __attribute__((preserve_all))
+        {
+            uint32_t low, high;
+        	asm volatile("rdpmc" : "=a" (low), "=d" (high) : "c" (counter));
+        	return low | ((uint64_t)high) << 32;
+        }
+        extern uint64_t data_buffer_start;
+        void malloc_hook2() __attribute__((preserve_all)) {
+            (&data_buffer_start)[++data_buffer_start] = native_read_pmc(0);
+        }
+    }
+    """
+end
 
+function lookup_external_symbol(modules, name)::UInt64
+    @show name
+    name == "data_buffer_start" && return data_buffer_start
+    return 0
+end
+
+shadowmod = Cxx.instance(TargetClang).shadow
+hookf = icxx"""$shadowmod->getFunction("malloc_hook3");"""
+xf = icxx"""$shadowmod->getFunction("malloc_hook2");"""
+
+cxxinclude(Pkg.dir("DIDebug","src","FunctionMover.cpp"))
+targetmod = icxx"""new llvm::Module("Target Module", $hookf->getParent()->getContext());"""
+icxx"""
+$targetmod->setDataLayout($hookf->getParent()->getDataLayout());
+FunctionMover2 mover($targetmod);
+MapFunction($hookf, &mover);
+MapFunction($xf, &mover);
+"""
+
+icxx"""
+$jit->addModule(std::unique_ptr<llvm::Module>($targetmod));
+"""
+buffer_start_addr = icxx"""$jit->findSymbol("malloc_hook3").getAddress();"""
+@assert buffer_start_addr != 0
+
+hook_template = Gallium.Hooking.hook_asm_template(UInt64(hook_addr),
+    UInt64(buffer_start_addr); call = false)
+orig_bytes = Gallium.load(task, RemotePtr{UInt8}(hook_addr), length(hook_template)+15)
+nbytes = Gallium.Hooking.determine_nbytes_to_replace(length(hook_template), orig_bytes)
+
+
+replacement = [hook_template; zeros(UInt8,nbytes-length(hook_template))]
+Gallium.store!(task, RemotePtr{UInt8}(hook_addr), replacement)
+Gallium.store!(task, RemotePtr{UInt8}(buffer_start_addr+9), 
+    Gallium.Hooking.hook_tail_template(orig_bytes[1:nbytes],UInt(hook_addr)+nbytes)
+)
+disassemble(orig_bytes[1:nbytes])
+
+bp = Gallium.breakpoint(timeline, :malloc)
+
+#=
 replacement = [hook_template; zeros(UInt8,nbytes-length(hook_template))]
 Gallium.store!(task, RemotePtr{UInt8}(hook_addr), replacement)
 Gallium.store!(task, RemotePtr{UInt8}(buffer_start_addr), 
@@ -258,7 +319,7 @@ Gallium.store!(task, RemotePtr{UInt8}(buffer_start_addr),
 disassemble(orig_bytes[1:nbytes])
 
 bp = Gallium.breakpoint(timeline, :malloc)
-
+=#
 
 #=
 stacktraces = UInt64[]

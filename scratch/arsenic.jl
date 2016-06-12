@@ -34,10 +34,10 @@ function replay(trace_dir="")
     RR.step_until_exec!(current_session(timeline))
     regs = icxx"$(current_vm(timeline))->regs();"
     rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
-    #=icxx"""
+    icxx"""
     rr::AutoRemoteSyscalls remote($(current_vm(timeline)));
     rr::Session::make_private_shared(remote,$(current_vm(timeline))->vm()->mapping_of($rsp));
-    """=#
+    """
     icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
     task = current_task(current_session(timeline))
     entrypt = compute_entry_ptr(RR.saved_auxv(task))
@@ -71,7 +71,7 @@ current_vm() = current_vm(timeline)
 
 function get_insts(stack)
     stack = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
-    base, mod = Gallium.find_module(modules, UInt(stack.ip))
+    base, mod = Gallium.find_module(timeline, modules, UInt(stack.ip))
     modrel = UInt(UInt(stack.ip)-base)
     if isnull(mod.xpdata)
         loc, fde = find_fde(mod, modrel)
@@ -86,6 +86,13 @@ function get_insts(stack)
         seekloc = loc - 0xa00
         nbytes = entry.stop - entry.start
     end
+    if ObjFileBase.isrelocatable(handle(mod))
+        # For JIT frames, base is the start of .text, so we need to add that
+        # offset back
+        text = first(filter(x->sectionname(x)==
+            ObjFileBase.mangle_sname(handle(mod),"text"),Sections(handle(mod))))
+        seekloc += sectionoffset(text)
+    end
     seek(handle(mod), seekloc)
     insts = read(handle(mod), UInt8, nbytes)
     base, loc, insts
@@ -98,20 +105,19 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:disas}, command)
     return false
 end
 
-function compute_stack(modules)
-    task = current_task(current_session(timeline));
+function compute_stack(modules, task = current_task(current_session(timeline)))
     did_fixup, regs = RR.fixup_RC(task, icxx"$task->regs();")
-    stack, RCs = Gallium.stackwalk(regs, current_task(current_session(timeline)), modules, rich_c = true, collectRCs = true)
+    stack, RCs = Gallium.stackwalk(regs, task, modules, rich_c = true, collectRCs = true)
     if length(stack) != 0
         stack[end].stacktop = !did_fixup
     end
-    Gallium.NativeStack(stack,RCs,modules)
+    Gallium.NativeStack(stack,RCs,modules,task)
 end
 
-function update_stack!(state)
-    state.interp = state.top_interp = compute_stack(state.top_interp.modules)
+function update_stack!(state, task = current_task(current_session(timeline)))
+    state.interp = state.top_interp = compute_stack(state.top_interp.modules, task)
 end
-update_stack!(state::Void) = nothing
+update_stack!(state::Void, _ = nothing) = nothing
 
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:si}, command)
     RR.single_step!(timeline)
@@ -120,7 +126,8 @@ function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,
 end
 
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:rsi}, command)
-    RR.reverse_single_step!(current_session(timeline),current_task(current_session(timeline)),timeline)
+    task = isa(stack, Gallium.NativeStack) ? stack.session : current_task(current_session(timeline))
+    RR.reverse_single_step!(current_session(timeline),task,timeline)
     update_stack!(state)
     return true
 end
@@ -279,7 +286,7 @@ end
 
 function ASTInterpreter.print_status(x::Gallium.CStackFrame; kwargs...)
     print("Stopped in function ")
-    found, symb = symbolicate_frame(modules, x)
+    found, symb = symbolicate_frame(timeline, modules, x)
     println(symb)
     if x.line != 0
         code = ASTInterpreter.readfileorhist(x.file)
@@ -301,12 +308,12 @@ function ASTInterpreter.print_status(x::Gallium.CStackFrame; kwargs...)
     disasm_around_ip(STDOUT, insts, ipoffset; ipbase=ipbase)
 end
 
-function symbolicate_frame(modules, x)
+function symbolicate_frame(session, modules, x)
     found = false
     symb = "Unknown Function"
     try
-        symb = demangle(Gallium.Unwinder.symbolicate(modules, UInt64(x.ip)))
-        found = true
+        symb = demangle(Gallium.Unwinder.symbolicate(session, modules, UInt64(x.ip)))
+        found = !contains(symb, "Unknown")
     catch err
         (!isa(err, ErrorException) || !contains(err.msg, "found")) && rethrow(err)
     end
@@ -315,7 +322,7 @@ end
 
 function ASTInterpreter.print_frame(io, num, x::Gallium.CStackFrame)
     print(io, "[$num] ")
-    found, symb = symbolicate_frame(modules, x)
+    found, symb = symbolicate_frame(timeline, modules, x)
     print(io, symb, " ")
     if x.line != 0
       print(io, " at ",x.file,":",x.line)
@@ -492,7 +499,7 @@ function ASTInterpreter.execute_command(state, stack, ::Val{:timejump}, command)
 end
 
 function Gallium.breakpoint(timeline::RR.ReplayTimeline, fname::Symbol)
-    syms = Gallium.lookup_syms(modules, fname)
+    syms = Gallium.lookup_syms(timeline, modules, fname)
     bp = Gallium.Breakpoint()
     for (h, base, sym) in syms
         addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
@@ -523,10 +530,15 @@ function Gallium.print_location(io::IO, vm::RR.ReplayTimeline, loc)
     println(io)
 end
 
+global focus_tid = 0
 function ASTInterpreter.execute_command(state, stack, ::Val{:c}, command)
     RR.single_step!(timeline)
     try
-        RR.continue!(timeline)
+        while true
+            res = RR.continue!(timeline)
+            stop_task = icxx"$res.break_status.task;"
+            (focus_tid == 0 || (stop_task != 0 && focus_tid == icxx"$stop_task->rec_tid;")) && break
+        end
     catch err
         !isa(err, InterruptException) && rethrow(err)
     end
@@ -558,33 +570,62 @@ function ASTInterpreter.execute_command(state, stack::Union{Gallium.CStackFrame,
     return true
 end
 
+function ASTInterpreter.execute_command(state, stack, ::Val{:task}, command)
+    subcommand = split(command, " ")[2:end]
+    if subcommand[1] == "list"
+        icxx"""
+            for (auto &task : $(current_session(timeline))->tasks())
+                $:(println(IOContext(STDOUT,:modules=>modules),
+                    icxx"return task.second;"); nothing);
+        """
+        println(STDOUT)
+    elseif subcommand[1] == "select"
+        n = parse(Int, subcommand[2])
+        (n < 1 || n > icxx"$(current_session(timeline))->tasks().size();") &&
+            (print_with_color(:red, STDERR, "Not a valid task"); return false)
+        it = icxx"$(current_session(timeline))->tasks().begin();"
+        while n > 1
+            icxx"++$it;";
+            n -= 1
+        end
+        update_stack!(state, icxx"$it->second;")
+        return true
+    end
+    return false
+end
+
+
 function prepare_remote_execution(timeline)
     session = icxx"$(current_session(timeline))->clone_diversion();"
 end
 
+function prepare_remote_execution(session::RR.ReplaySession)
+    session = icxx"$session->clone_diversion();"
+end
 
-function run_jl_(timeline, val)
+function run_function(f, timeline, func, val)
     diversion = prepare_remote_execution(timeline)
     
     # Pick an arbitrary task to run our expression
     task = icxx"$diversion->tasks().begin()->second;"
     regs = icxx"$task->regs();"
     
-    # Find the jl_ ip
-    (h, base, sym)  = Gallium.lookup_sym(modules, :jl_)
+    # Find the function ip
+    (h, base, sym)  = Gallium.lookup_sym(timeline, modules, func)
     addr = base + ObjFileBase.deref(sym).st_value
     
     # Set up the call frame
     Gallium.set_ip!(regs, addr)
     new_rsp = Gallium.get_dwarf(regs, :rsp)-250
     new_rsp -= (new_rsp % 16)
+    new_rsp += 8
     Gallium.set_dwarf!(regs, :rsp, new_rsp)
     
     # Set return address to 0
     Gallium.store!(task, Gallium.RemotePtr{UInt64}(new_rsp), UInt64(0))
     
     # Set up arguments
-    Gallium.set_dwarf!(regs, :rsi, val)
+    Gallium.set_dwarf!(regs, :rdi, val)
 
     # Writes registers back to task
     icxx"$task->set_regs($regs);"
@@ -597,6 +638,8 @@ function run_jl_(timeline, val)
             break
         end
     end
+    
+    f(task)
 end
 
 

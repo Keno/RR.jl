@@ -7,21 +7,23 @@ module RR
     using ObjFileBase
 
     function __init__()
-        Libdl.dlopen(joinpath(ENV["HOME"],"rr-vanilla-build/lib/librr.so"),
+        Libdl.dlopen(joinpath(ENV["HOME"],"rr-build/lib/librr.so"),
             Libdl.RTLD_GLOBAL)
-        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr-vanilla/src"), kind = C_System)
-        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr-vanilla-build"), kind = C_System)
+        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr/src"), kind = C_System)
+        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr-build"), kind = C_System)
         cxx"""
             #include <RecordSession.h>
             #include <RecordTask.h>
             #include <ReplayTask.h>
             #include <ReplayTimeline.h>
             #include <AutoRemoteSyscalls.h>
+            #include <GdbServer.h>
             #include <algorithm>
         """
     end
     __init__()
 
+    const AnyTask = Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask",pcpp"rr::Task"}
     const ReplaySession = Union{cxxt"rr::ReplaySession::shr_ptr",pcpp"rr::ReplaySession"}
     const RecordSession = Union{cxxt"rr::RecordSession::shr_ptr",pcpp"rr::RecordSession"}
     const ReplayTimeline = Union{pcpp"rr::ReplayTimeline"}
@@ -113,8 +115,13 @@ module RR
             vm = current_task(current_session(timeline)))
         task = current_task(current_session(timeline))
         regs = icxx"$(task)->regs();"
+        addr = ip(regs)
+        icxx"""
+            auto it = $task->vm()->breakpoints.find($addr);
+            it == $task->vm()->breakpoints.end();
+        """ && return false
         insts = load(task, RemotePtr{UInt8}(ip(regs)), 15)
-        insts[1] = orig_byte(task, ip(regs))
+        insts[1] = orig_byte(task, addr)
         Gallium.X86_64.instemulate!(insts, vm, regs) || return false
         icxx"$task->set_regs($regs);"
         return true
@@ -147,13 +154,19 @@ module RR
     
     # We consider the last thread exit to be an implicit breakpoint
     function is_last_thread_exit(status)
-        icxx"$status.task_exit && $status.task->task_group()->task_set().size() == 1;"
+        is_task_exit(status) && icxx"$status.task->task_group()->task_set().size() == 1;"
+    end
+    
+    function is_task_exit(status)
+        icxx"$status.task_exit;"
     end
     
     is_break_sig(status) = icxx"$status.signal == 11;" || icxx"$status.signal == 4;"
 
     function step_until_bkpt!(timeline::ReplayTimeline)
         while true
+            icxx"$timeline->apply_breakpoints_and_watchpoints();"
+            local res
             exited, bp_hit = disable_sigint() do
                 res = icxx"$(current_session(timeline))->replay_step(rr::RUN_CONTINUE);"
                 (icxx"$res.status == rr::REPLAY_EXITED;",
@@ -161,8 +174,8 @@ module RR
                  is_last_thread_exit(icxx"$res.break_status;") ||
                  is_break_sig(icxx"$res.break_status;"))
             end
-            exited && return false
-            bp_hit && return true
+            exited && return (false, res)
+            bp_hit && return (true, res)
             icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
         end
     end
@@ -181,10 +194,12 @@ module RR
     end
     
     function continue!(timeline)
-        while step_until_bkpt!(timeline)
+        while true
+            bp_hit, res = step_until_bkpt!(timeline)
+            bp_hit || return res
             regs = icxx"$(current_task(current_session(timeline)))->regs();"
             if process_lowlevel_conditionals(Location(timeline, ip(regs)), regs)
-                break
+                return res
             end
             # Step past the breakpoint
             single_step!(timeline)
@@ -200,7 +215,7 @@ module RR
         end
     end
 
-    function read_exe(task)
+    function read_exe(task::AnyTask)
         @assert task != C_NULL
         readmeta(IOBuffer(open(read,Cxx.unsafe_string(icxx"$task->vm()->exe_image();"))))
     end
@@ -208,6 +223,8 @@ module RR
     function read_exe(session::Session)
         read_exe(current_task(session))
     end
+    
+    read_exe(timeline::ReplayTimeline) = read_exe(current_session(timeline))
 
     using Gallium.Hooking: PROT_READ, PROT_WRITE
     # Mapping remote mappings
@@ -242,14 +259,15 @@ module RR
         RemotePtr{T}(UInt(ptr))
 
     typealias RRRemotePtr{T} Union{RemotePtr{T}, cxxt"rr::remote_ptr<$T>"}
-    function load{T<:Cxx.CxxBuiltinTypes}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T})
+    Gallium.RemotePtr{T}(ptr::cxxt"rr::remote_ptr<$T>") = Gallium.RemotePtr{T}(UInt64(ptr))
+    function load{T<:Cxx.CxxBuiltinTypes}(vm::AnyTask, ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
         res = icxx"$vm->read_mem($ptr,&$ok);"
         ok[] || error("Failed to read memory at address $ptr")
         res
     end
 
-    function load{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T})
+    function load{T}(vm::AnyTask, ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
         res = Ref{T}()
         icxx"$vm->read_bytes_helper(
@@ -259,7 +277,7 @@ module RR
         res[]
     end
     
-    function store!{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask",pcpp"rr::Task"}, ptr::RRRemotePtr{T}, val::T)
+    function store!{T}(vm::AnyTask, ptr::RRRemotePtr{T}, val::T)
         ok = Ref{Bool}(true)
         res = Ref{T}(val)
         icxx"$vm->write_bytes_helper(
@@ -269,7 +287,16 @@ module RR
         nothing
     end
 
-    function load{T}(vm::Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask"}, ptr::RRRemotePtr{T}, n)
+    function store!{T}(vm::AnyTask, ptr::RRRemotePtr{T}, vec::Vector{T})
+        ok = Ref{Bool}(true)
+        icxx"$vm->write_bytes_helper(
+            rr::remote_ptr<uint8_t>($(UInt64(ptr))),
+            $(sizeof(vec)),$(Ptr{UInt8}(pointer(vec))),&$ok);"
+        ok[] || error("Failed to write memory at address $ptr")
+        nothing
+    end
+
+    function load{T}(vm::AnyTask, ptr::RRRemotePtr{T}, n)
         ok = Ref{Bool}(true)
         res = Vector{T}(n)
         icxx"$vm->read_bytes_helper(
@@ -279,12 +306,35 @@ module RR
         res
     end
 
+    load(vm::ReplayTimeline, args...) =
+        load(current_task(current_session(vm)), args...)
+
+    store!(vm::ReplayTimeline, args...) =
+        store!(current_task(current_session(vm)), args...)
+
+    # Task `12345` mmap_hardlink_1_julia at ip-loc
+    function Base.show(io::IO, task::AnyTask)
+        modules = get(io, :modules, nothing)
+        ip = UInt(Gallium.ip(fixup_RC(task,icxx"$task->regs();")[2]))
+        session = icxx"&$task->session();"
+        ssession = icxx"$session->as_replay();"
+        ssession == C_NULL && (ssession = icxx"$session->as_record();")
+        ssession == C_NULL && (ssession = icxx"$session->as_diversion();")
+        print(io, "Task `", icxx"$task->tid;", "` (rec ",
+            icxx"$task->rec_tid;", ") ",
+            Cxx.unsafe_string(icxx"$task->vm()->exe_image();"),
+            " at 0x",hex(ip)," ",modules !== nothing ?
+            Gallium.Unwinder.symbolicate(ssession, modules, ip) : "")
+    end
+
     saved_auxv(vm::pcpp"rr::ReplayTask") = map(unsafe_load,icxx"$vm->vm()->saved_auxv();")
 
-    function mapped_file(vm::pcpp"rr::ReplayTask", ptr)
+    function mapped_file(vm::AnyTask, ptr)
         @assert icxx"$vm->vm()->has_mapping($ptr);"
         Cxx.unsafe_string(icxx"$vm->vm()->mapping_of($ptr).map.fsname();")
     end
+    mapped_file(vm::ReplayTimeline, ptr) =
+        mapped_file(current_task(current_session(vm)), ptr)
 
     import Gallium.GlibcDyldModules: load_library_map, compute_entry_ptr
     function load_library_map(task::pcpp"rr::ReplayTask", imageh)
@@ -320,7 +370,7 @@ module RR
         redirecting to its own mapped page. If we're on that page, do the first
         unwind step manually to get the correct register context.
     """
-    function fixup_RC(task::pcpp"rr::ReplayTask", RC)
+    function fixup_RC(task::AnyTask, RC)
         RC = copy(RC)
         theip = ip(RC)
         did_fixup = false
@@ -363,5 +413,20 @@ module RR
     function seek(timeline, mark::cxxt"rr::ReplayTimeline::ProtoMark")
         icxx"$timeline->seek_to_proto_mark($mark);"
     end
+    
+    immutable AddressSpaceUid
+        pid::Int32
+        serial::UInt32
+        exec_count::UInt32
+    end
+    
+    Gallium.current_asid(task::AnyTask) = 
+        reinterpret(AddressSpaceUid, [icxx"$task->vm()->uid();".data])[]
+        
+    Gallium.current_asid(session::ReplaySession) =
+        Gallium.current_asid(current_task(session))
+
+    Gallium.current_asid(timeline::ReplayTimeline) =
+        Gallium.current_asid(current_session(timeline))
 
 end # module

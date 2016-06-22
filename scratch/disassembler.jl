@@ -85,6 +85,12 @@ function mayAffectControlFlow(inst, ctx)
   """
 end
 
+function mayBranch(inst, ctx)
+  icxx"""
+    $(ctx.MII)->get($inst->getOpcode()).isBranch();
+  """
+end
+
 #=
 function disassembleInstruction(f::Function, data::Vector{UInt8}, offset; ctx = DisAsmContext())
   icxx"""
@@ -196,6 +202,34 @@ function disassemble2(base, size; kwargs...)
     disassemble2(data; kwargs...)
 end
 
+function extract_next_inst(insts::Vector{UInt8}, ctx = DisAsmContext())
+  size = icxx"""
+    uint64_t InstSize;
+    uint8_t *Base = (uint8_t*)$(pointer(insts));
+    uint64_t Total = $(sizeof(insts));
+    uint64_t LoadAddress = 0;
+    for (uint64_t Offset = 0; Offset < Total; Offset += InstSize)
+    {
+      MCInst Inst;
+      MCDisassembler::DecodeStatus S;
+
+      S = $(ctx.DisAsm)->getInstruction(Inst, InstSize,
+          ArrayRef<uint8_t>(Base+Offset, Total-Offset),
+            LoadAddress + Offset, /*REMOVE*/ nulls(), nulls());
+
+      switch (S) {
+      case MCDisassembler::SoftFail:
+      case MCDisassembler::Fail:
+        return (uint64_t)0;
+      case MCDisassembler::Success:
+          $(ctx.MIP)->printInst(&Inst, outs(), "", *$(ctx.MSTI));
+        return InstSize;
+      }
+    }
+    return (uint64_t)0;
+  """
+  insts[1:size]
+end
 
 function disassemble(insts::Vector{UInt8}, ctx = DisAsmContext())
   icxx"""

@@ -23,7 +23,8 @@ module RR
     end
     __init__()
 
-    const AnyTask = Union{pcpp"rr::ReplayTask",pcpp"rr::RecordTask",pcpp"rr::Task"}
+    const ReplayTask = pcpp"rr::ReplayTask"
+    const AnyTask = Union{ReplayTask,pcpp"rr::RecordTask",pcpp"rr::Task"}
     const ReplaySession = Union{cxxt"rr::ReplaySession::shr_ptr",pcpp"rr::ReplaySession"}
     const RecordSession = Union{cxxt"rr::RecordSession::shr_ptr",pcpp"rr::RecordSession"}
     const ReplayTimeline = Union{pcpp"rr::ReplayTimeline"}
@@ -166,6 +167,7 @@ module RR
     function step_until_bkpt!(timeline::ReplayTimeline)
         while true
             icxx"$timeline->apply_breakpoints_and_watchpoints();"
+            icxx"$(current_session(timeline))->set_visible_execution(true);"
             local res
             exited, bp_hit = disable_sigint() do
                 res = icxx"$(current_session(timeline))->replay_step(rr::RUN_CONTINUE);"
@@ -272,7 +274,7 @@ module RR
         res = Ref{T}()
         icxx"$vm->read_bytes_helper(
             rr::remote_ptr<uint8_t>($(UInt64(ptr))),
-            $(sizeof(T)),(uint8_t*)&$res,&$ok);"
+            $(sizeof(T)),(uint8_t*)$(Base.unsafe_convert(Ptr{Void},res)),&$ok);"
         ok[] || error("Failed to read memory at address $ptr")
         res[]
     end
@@ -322,7 +324,7 @@ module RR
         ssession == C_NULL && (ssession = icxx"$session->as_diversion();")
         print(io, "Task `", icxx"$task->tid;", "` (rec ",
             icxx"$task->rec_tid;", ") ",
-            Cxx.unsafe_string(icxx"$task->vm()->exe_image();"),
+            unsafe_string(icxx"$task->vm()->exe_image();"),
             " at 0x",hex(ip)," ",modules !== nothing ?
             Gallium.Unwinder.symbolicate(ssession, modules, ip) : "")
     end
@@ -331,7 +333,7 @@ module RR
 
     function mapped_file(vm::AnyTask, ptr)
         @assert icxx"$vm->vm()->has_mapping($ptr);"
-        Cxx.unsafe_string(icxx"$vm->vm()->mapping_of($ptr).map.fsname();")
+        unsafe_string(icxx"$vm->vm()->mapping_of($ptr).map.fsname();")
     end
     mapped_file(vm::ReplayTimeline, ptr) =
         mapped_file(current_task(current_session(vm)), ptr)
@@ -428,5 +430,11 @@ module RR
 
     Gallium.current_asid(timeline::ReplayTimeline) =
         Gallium.current_asid(current_session(timeline))
+
+    silence!(timeline) =
+        icxx"$(current_session(timeline))->set_visible_execution(false);"
+
+    Gallium.ip(task::AnyTask) = Gallium.ip(icxx"$task->regs();")
+    Gallium.ip(timeline::ReplayTimeline) = Gallium.ip(current_task(current_session(timeline)))
 
 end # module

@@ -21,6 +21,7 @@ using DWARF.CallFrameInfo
 using Gallium.Unwinder: find_fde
 using ObjFileBase: handle
 using Gallium: Location
+using AbstractTrees
 
 import Gallium.GlibcDyldModules: compute_entry_ptr
 
@@ -31,6 +32,12 @@ function replay(trace_dir="")
     timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
     session = nothing
     icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+    icxx"$(current_session(timeline))->set_visible_execution(true);"
+    icxx"""
+        rr::ReplaySession::Flags result;
+        result.redirect_stdio = true;
+        $(current_session(timeline))->set_flags(result);
+    """
     RR.step_until_exec!(current_session(timeline))
     regs = icxx"$(current_vm(timeline))->regs();"
     rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
@@ -49,18 +56,6 @@ function replay(trace_dir="")
     modules = Gallium.GlibcDyldModules.load_library_map(current_task(current_session(timeline)), imageh)
 
     timeline, modules
-end
-
-function compute_remap()
-    t = current_task(current_session(timeline))
-    regs = icxx"$t->regs();"
-    rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
-    map = icxx"""
-    $t->vm()->mapping_of($rsp);
-    """
-    @assert icxx"$map.local_addr;" != C_NULL
-    Gallium.Remap[Gallium.Remap(icxx"$map.map.start();",icxx"$map.map.size();",
-    pointer_to_array(Ptr{UInt8}(icxx"$map.local_addr;"), (icxx"$map.map.size();",), false))]
 end
 #=
 stack_remap = compute_remap()
@@ -136,6 +131,8 @@ end
 Attempt to reverse step until the entry to the current function.
 """
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:rf}, command)
+    RR.silence!(timeline)
+    
     # Algorithm:
     # 1. Determine the location of the function entry point.
     # 2. Determine how to compute the CFA, both here and at the function entry
@@ -188,6 +185,101 @@ function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,
     return true
 end
 
+function iterate_instructions(f, timeline)
+    regs = icxx"$(current_task(current_session(timeline)))->regs();"
+    addr = UInt64(Gallium.ip(regs))
+    ctx = DisAsmContext()
+    cont = true
+    while cont
+        insts = Gallium.load(timeline, RemotePtr{UInt8}(addr), 15)
+        (Inst, InstSize) = getInstruction(insts, 0; ctx = ctx)
+        cont = f(addr, Inst, ctx)
+        addr += InstSize
+        free(Inst)
+    end
+end
+
+function NextBranchAddr(timeline)
+    addr = 0
+    iterate_instructions(timeline) do where, Inst, ctx
+        mayBranch(Inst, ctx) && return false
+        addr = where
+        return true
+    end
+    return addr
+end
+
+function LastInstrInRange(timeline, range)
+    addr = 0
+    iterate_instructions(timeline) do where, Inst, ctx
+        where > last(range) && return false
+        addr = where
+        return true
+    end
+    return addr
+end
+
+function step_over(timeline, range)
+    while true
+        nba = NextBranchAddr(timeline)
+        isbranch = true
+        if !(nba ∈ range)
+            nba = LastInstrInRange(timeline, range)
+            isbranch = false
+        end
+        bp = Gallium.breakpoint(timeline, nba)
+        # get_frame
+        while true
+            RR.step_until_bkpt!(timeline)
+            #comp = compare_frames(frame, timeline)
+            #if older
+            #    Gallium.disable(bp)
+            #    return
+            #elseif younger
+            #    continue
+            #else
+            #    break
+            #end
+            break
+        end
+        # Ok, we've arrived at our breakpoint in the same frame
+        Gallium.disable(bp)
+        # We're at an instruction that may step out of the range. Single
+        # step and see where we are
+        RR.single_step!(timeline)
+        (UInt64(Gallium.ip(timeline)) ∈ range) && continue
+        break
+    end
+end
+
+function compute_current_line_range(state, stack)
+    mod, base, ip = Gallium.modbaseip_for_stack(state, stack)
+    linetab, lip = Gallium.obtain_linetable(state, stack)
+    sm = start(linetab)
+    local current_entry
+    local newentry
+    # Start by finding the entry that we're in
+    while true
+        newentry, sm = next(linetab, sm)
+        newentry.address > lip && break
+        current_entry = newentry
+    end
+    range = origrange = current_entry.address:(newentry.address-1)
+    # Merge any subsequent entries at the same line
+    while newentry.line == current_entry.line
+        newentry, sm = next(linetab, sm)
+        range = first(origrange):(newentry.address-1)
+    end
+    range += UInt64(ip-lip)
+    range
+end
+
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:n}, command)
+    range = compute_current_line_range(state, stack)
+    step_over(timeline, range)
+    update_stack!(state)
+    return true
+end
 
 function ASTInterpreter.execute_command(state, stack::Union{Gallium.NativeStack,Gallium.CStackFrame}, ::Val{:ip}, command)
     x = isa(stack, Gallium.NativeStack) ? stack.stack[end] : stack
@@ -284,10 +376,11 @@ function disasm_around_ip(io, insts, ipoffset; ipbase = 0, circular = true)
     end
 end
 
-function ASTInterpreter.print_status(x::Gallium.CStackFrame; kwargs...)
+function ASTInterpreter.print_status(state, x::Gallium.CStackFrame; kwargs...)
     print("Stopped in function ")
     found, symb = symbolicate_frame(timeline, modules, x)
     println(symb)
+    
     if x.line != 0
         code = ASTInterpreter.readfileorhist(x.file)
         if code !== nothing
@@ -570,6 +663,53 @@ function ASTInterpreter.execute_command(state, stack::Union{Gallium.CStackFrame,
     return true
 end
 
+function dwarf2Cxx(dbgs, dwarfT)
+    if DWARF.tag(dwarfT) == DWARF.DW_TAG_pointer_type || 
+            DWARF.tag(dwarfT) == DWARF.DW_TAG_array_type
+        dwarfT = get(DWARF.extract_attribute(dwarfT,DWARF.DW_AT_type))
+        return Cxx.pointerTo(Cxx.instance(RemoteClang), dwarf2Cxx(dbgs, dwarfT.value))
+    else
+        name = DWARF.extract_attribute(dwarfT,DWARF.DW_AT_name)
+        name = bytestring(get(name).value,StrTab(dbgs.debug_str))
+        return cxxparse(Cxx.instance(RemoteClang),name,true)
+    end
+end
+
+function iterate_frame_variables(state, stack, found_cb, not_found_cb)
+    mod, base, theip = Gallium.modbaseip_for_stack(state, stack)
+    lip = Gallium.compute_ip(Gallium.dhandle(mod),base,theip)
+    dbgs = debugsections(Gallium.dhandle(mod))
+    ns = state.top_interp
+    @assert isa(ns, Gallium.NativeStack)
+    RC = ns.RCs[end-(state.level-1)]
+    
+    Gallium.iterate_variables(RC, found_cb, not_found_cb, dbgs, lip)
+end
+    
+
+function realize_remote_value(T, val, getreg)
+    if isa(val, DWARF.Expressions.MemoryLocation)
+        val = Gallium.load(timeline, RemotePtr{T}(val.i))
+    elseif isa(val, DWARF.Expressions.RegisterLocation)
+        val = reinterpret(T, [getreg(val.i)])[]
+    end
+    val
+end
+
+function ASTInterpreter.execute_command(state, stack::Union{Gallium.CStackFrame,Gallium.NativeStack}, ::Val{:vars}, command)
+    function found_cb(dbgs, vardie, getreg, name, val)
+        dwarfT = get(DWARF.extract_attribute(vardie,DWARF.DW_AT_type))
+        try 
+            T = Cxx.juliatype(dwarf2Cxx(dbgs, dwarfT.value))
+            val = realize_remote_value(T, val, getreg)
+        end
+        @show (name, val)
+    end
+    iterate_frame_variables(state, stack, found_cb, (dbgs, vardie, name)->nothing)
+    
+    return false
+end
+
 function ASTInterpreter.execute_command(state, stack, ::Val{:task}, command)
     subcommand = split(command, " ")[2:end]
     if subcommand[1] == "list"
@@ -603,16 +743,23 @@ function prepare_remote_execution(session::RR.ReplaySession)
     session = icxx"$session->clone_diversion();"
 end
 
-function run_function(f, timeline, func, val)
+function run_function(f, timeline, name::Union{Symbol,AbstractString}, args::Vector)
+    # Find the function ip
+    (h, base, sym)  = Gallium.lookup_sym(timeline, modules, name)
+    addr = base + ObjFileBase.deref(sym).st_value
+    run_function(f, timeline, addr, args)
+end
+
+run_function(f, timeline, name, args::Union{Integer,Ptr}) = run_function(f, timeline, name, [args])
+
+const args_regs = [:rdi, :rsi, :rdx, :rcx, :r8, :r9]
+function run_function(f, timeline, addr::Integer, args::Vector)
     diversion = prepare_remote_execution(timeline)
+    icxx"$diversion->set_visible_execution(true);"
     
     # Pick an arbitrary task to run our expression
     task = icxx"$diversion->tasks().begin()->second;"
     regs = icxx"$task->regs();"
-    
-    # Find the function ip
-    (h, base, sym)  = Gallium.lookup_sym(timeline, modules, func)
-    addr = base + ObjFileBase.deref(sym).st_value
     
     # Set up the call frame
     Gallium.set_ip!(regs, addr)
@@ -625,7 +772,10 @@ function run_function(f, timeline, func, val)
     Gallium.store!(task, Gallium.RemotePtr{UInt64}(new_rsp), UInt64(0))
     
     # Set up arguments
-    Gallium.set_dwarf!(regs, :rdi, val)
+    for (i,val) in enumerate(args)
+        i > length(args_regs) && error("Too many arguments")
+        Gallium.set_dwarf!(regs, args_regs[i], UInt64(val))
+    end
 
     # Writes registers back to task
     icxx"$task->set_regs($regs);"
@@ -633,7 +783,7 @@ function run_function(f, timeline, func, val)
     # Alright, let's go
     while true
         res = icxx"$diversion->diversion_step($task);"
-        if icxx"$res.status == rr::DiversionSession::DIVERSION_CONTINUE;" ||
+        if icxx"$res.status != rr::DiversionSession::DIVERSION_CONTINUE;" ||
             icxx"$res.break_status.signal != 0;"
             break
         end
@@ -642,5 +792,244 @@ function run_function(f, timeline, func, val)
     f(task)
 end
 
+# Remote C execution
+
+include(Pkg.dir("Gallium","src","remoteir.jl"))
+
+@cxxm "uint64_t GalliumCallbacks::allocateMem(uint32_t kind, uint64_t Size, uint64_t Align)" begin
+    global code_mem, ro_mem, rw_mem
+    if kind == icxx"llvm::sys::Memory::MF_EXEC | llvm::sys::Memory::MF_READ;"
+        code_mem += code_mem % Align
+        ret = code_mem
+        code_mem += Size
+        return UInt64(ret)
+    elseif kind == icxx"llvm::sys::Memory::MF_READ;"
+        ro_mem += ro_mem % Align
+        ret = ro_mem
+        ro_mem += Size
+        return UInt64(ret)
+    elseif kind == icxx"llvm::sys::Memory::MF_READ | llvm::sys::Memory::MF_WRITE;"
+        rw_mem += rw_mem % Align
+        ret = rw_mem
+        rw_mem += Size
+        return UInt64(ret)
+    else
+        error("Unknown kind")
+    end
+end
+
+@cxxm "void GalliumCallbacks::writeMem(uint64_t remote, uint8_t *localaddr, size_t size)" begin
+    session = unsafe_pointer_to_objref(icxx"$this->session;")
+    Gallium.store!(session,RemotePtr{UInt8}(remote),
+        unsafe_wrap(Array, localaddr, size, false))
+end
+
+function lookup_external_symbol(modules, name)::UInt64
+    global data_buffer_start
+    name == "data_buffer_start" && return data_buffer_start
+    h,base,sym = Gallium.lookup_sym(timeline, modules, name)
+    ret = UInt64(Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value))
+    return ret
+end
+
+
+# Now allocate some memory for the JIT
+function create_remote_jit(timeline, near_addr)
+    always_free_addresses = icxx"""
+        rr::TraceReader reader{$(current_session(timeline))->trace_reader()};
+        reader.rewind();
+        rr::ReplaySession::always_free_address_space(reader);
+    """
+
+    start_addr = icxx"""
+        for (auto range : $always_free_addresses) {
+            if (std::abs((intptr_t)(range.start().as_int() - $(UInt64(near_addr)))) < INT32_MAX/2) {
+                return range.start().as_int();
+            } else if (std::abs((intptr_t)(range.end().as_int() - 0x1000 - $(UInt64(near_addr)))) < INT32_MAX/2) {
+                return range.end().as_int() -  0x40000;
+            }
+        }
+        return (uint64_t)0;
+    """
+    global code_mem, ro_mem, rw_mem
+    region_size = 0x10000 # 16 pages
+    code_mem = start_addr
+    icxx"""
+    rr::AutoRemoteSyscalls remote($(current_task(current_session(timeline))));
+    remote.infallible_mmap_syscall($code_mem, $region_size,
+        PROT_EXEC | PROT_READ,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    """
+    ro_mem = start_addr + region_size
+    icxx"""
+    rr::AutoRemoteSyscalls remote($(current_task(current_session(timeline))));
+    remote.infallible_mmap_syscall($ro_mem, $region_size,
+        PROT_READ,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    """
+    rw_mem = start_addr + 2region_size
+    icxx"""
+    rr::AutoRemoteSyscalls remote($(current_task(current_session(timeline))));
+    remote.infallible_mmap_syscall($rw_mem, $region_size,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    """
+    stack_mem = 0x700001000
+    icxx"""
+    rr::AutoRemoteSyscalls remote($(current_task(current_session(timeline))));
+    remote.infallible_mmap_syscall($stack_mem, $region_size,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    """
+
+    memm = icxx"""
+    GalliumCallbacks callbacks;
+    callbacks.session = $(pointer_from_objref(timeline));
+    new RCMemoryManager(std::move(callbacks));
+    """
+    callbacks = icxx"&$memm->Client;"
+    jit = icxx"new RemoteJIT(*llvm::EngineBuilder().selectTarget(), $memm);"
+    jit, callbacks
+end
+
+cxxinclude(Pkg.dir("DIDebug","src","FunctionMover.cpp"))
+TargetClang = Cxx.new_clang_instance(false)
+
+function allocate_code(callbacks, code)
+    addr = icxx"$callbacks->allocateMem(
+        llvm::sys::Memory::MF_EXEC | llvm::sys::Memory::MF_READ,
+        $(sizeof(code)), 0x16);"
+    icxx"$callbacks->writeMem($addr,(uint8_t*)$(pointer(code)),$(sizeof(code)));"
+    addr
+end
+
+function rewrite_instruction(inst, end_ip)
+    # Adjust RIP-relative mov
+    length(inst) == 7 || return inst
+    # REX.W(R)
+    ((inst[1] & 0b11111011) == 0b01001000) || return inst
+    # opcode
+    (inst[2] == 0x8b) || return inst
+    # MODRM, mod = 0b00, r/m = 0b101
+    ((inst[3] & 0b11000111) == 0b00000101) || return inst
+    # Ok, we have a RIP-relative MOV
+    addr = UInt64(end_ip+reinterpret(Int32, inst[4:7])[])
+    # Instead encode an absolute MOV
+    reg = (inst[3]&0b111000) >> 3
+    [
+        # mov $abs, %reg
+        inst[1]; 0xb8+reg; reinterpret(UInt8,[addr]);
+        # move (%reg), %reg
+        inst[1]; 0x8b; (reg<<3)|reg
+    ]
+end
+
+function rewrite_instructions(insts, start_ip)
+    rewritten_insts = UInt8[]
+    current_end_ip = start_ip
+    while current_end_ip < start_ip+length(insts)
+        next_inst = extract_next_inst(insts[(1+current_end_ip-start_ip):end])
+        current_end_ip += length(next_inst)
+        next_inst = rewrite_instruction(next_inst, current_end_ip)
+        append!(rewritten_insts, next_inst)
+    end
+    rewritten_insts
+end
+
+Base.unsafe_string(ref::vcpp"llvm::StringRef") =
+    unsafe_string(icxx"$ref.data();", icxx"$ref.size();")
+function run_func(timeline, jit, callbacks,
+        fname::Union{pcpp"clang::Decl",pcpp"clang::FunctionDecl"}, retT=Void, TargetClang = TargetClang, args = Any[])
+    run_func(timeline, jit, callbacks, 
+        unsafe_string(icxx"cast<clang::NamedDecl>($fname)->getName();"),
+        retT, TargetClang, args)
+end
+
+function run_func(timeline, jit, callbacks,
+        fname::pcpp"llvm::Function", retT=Void, TargetClang = TargetClang, args = Any[])
+    run_func(timeline, jit, callbacks, 
+        unsafe_string(icxx"$fname->getName();"), retT, TargetClang, args)
+end
+
+
+function run_func(timeline, jit, callbacks, fname, retT=Void, TargetClang = TargetClang, args=Any[])
+    shadowmod = Cxx.instance(TargetClang).shadow
+    targetmod = icxx"""new llvm::Module("Target Module", $shadowmod->getContext());"""
+    icxx"""$targetmod->setDataLayout($shadowmod->getDataLayout());"""
+    
+    mover = icxx"new FunctionMover2($targetmod);"
+    
+    F = icxx"$shadowmod->getFunction($(pointer(fname)));"
+    @assert F != C_NULL
+    icxx"MapFunction($F, $mover);"
+
+    icxx"""
+    $jit->addModule(std::unique_ptr<llvm::Module>($targetmod));
+    """
+    
+    addr = icxx"""$jit->findSymbol($(pointer(fname)), false).getAddress();"""
+    @assert UInt64(addr) != 0
+    
+    run_function(timeline, UInt64(addr), args) do task
+        regs = icxx"$task->regs();"
+        x = Gallium.ip(regs)
+        @assert UInt64(x) == 0
+        sizeof(retT) == 0 && return retT.instance
+        reinterpret(retT, [Gallium.get_dwarf(regs, :rax)])[]
+    end
+end
+
+function trace_func(jit, callbacks, fname, entry_func, exit_func = "")
+    h,base,sym = Gallium.lookup_sym(timeline, modules, fname)
+    hook_addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
+    
+    shadowmod = Cxx.instance(TargetClang).shadow
+    targetmod = icxx"""new llvm::Module("Target Module", $shadowmod->getContext());"""
+    icxx"""$targetmod->setDataLayout($shadowmod->getDataLayout());"""
+    
+    mover = icxx"new FunctionMover2($targetmod);"
+    
+    F = icxx"$shadowmod->getFunction($(pointer(entry_func)));"
+    @assert F != 0
+    icxx"MapFunction($F, $mover);"
+
+    if !isempty(exit_func)
+        F = icxx"$shadowmod->getFunction($(pointer(exit_func)));"
+        @assert F != 0
+        icxx"MapFunction($F, $mover);"    
+    end
+
+    icxx"""
+    $jit->addModule(std::unique_ptr<llvm::Module>($targetmod));
+    """
+    
+    entry_hook = icxx"""$jit->findSymbol($(pointer(entry_func))).getAddress();"""
+    exit_hook = isempty(exit_func) ? UInt64(0) :
+        icxx"""$jit->findSymbol($(pointer(exit_func))).getAddress();"""
+
+    hook_template = Gallium.Hooking.hook_asm_template(UInt64(0),
+        UInt64(0); call = false)
+
+    orig_bytes = Gallium.load(task, RemotePtr{UInt8}(hook_addr), length(hook_template)+15)
+    nbytes = Gallium.Hooking.determine_nbytes_to_replace(length(hook_template), orig_bytes)
+
+    ret_jmp_addr = isempty(exit_func) ? UInt64(0) : allocate_code(callbacks, [
+        Gallium.Hooking.return_hook_template(0x700011000, exit_hook);
+    ])
+
+    jmp_addr = allocate_code(callbacks, [
+        Gallium.Hooking.instrument_jmp_template(0x700011000,entry_hook,ret_jmp_addr);
+        Gallium.Hooking.hook_tail_template(
+            rewrite_instructions(orig_bytes[1:nbytes],UInt(hook_addr)),
+            UInt(hook_addr)+nbytes)
+    ])
+
+    hook_template = Gallium.Hooking.hook_asm_template(UInt64(hook_addr),
+        UInt64(jmp_addr); call = false)
+
+    replacement = [hook_template; zeros(UInt8,nbytes-length(hook_template))]
+    Gallium.store!(task, RemotePtr{UInt8}(hook_addr), replacement)
+
+end
 
 RunDebugREPL() = ASTInterpreter.RunDebugREPL(compute_stack(modules))

@@ -18,32 +18,6 @@ modules = Gallium.MultiASModules{RR.AddressSpaceUid}(Dict{RR.AddressSpaceUid, An
     LazyJITModules(Gallium.GlibcDyldModules.load_library_map(session, imageh), 0)
 end
 
-function Gallium.retrieve_obj_data(timeline::Union{RR.ReplayTimeline, RR.ReplaySession}, ip)
-    run_function(timeline, :jl_get_dobj_data, ip) do task
-        regs = icxx"$task->regs();"
-        @assert UInt(Gallium.ip(regs)) == 0
-        array_ptr = Gallium.get_dwarf(regs, :rax)
-        data_ptr = Gallium.load(task, RemotePtr{RemotePtr{UInt8}}(array_ptr))
-        data_size = Gallium.load(task, RemotePtr{Csize_t}(array_ptr+8))
-        Gallium.load(task, data_ptr, data_size)
-    end
-end
-
-function Gallium.retrieve_section_start(timeline::Union{RR.ReplayTimeline, RR.ReplaySession}, ip)
-    run_function(timeline, :jl_get_section_start, ip) do task
-        regs = icxx"$task->regs();"
-        (UInt(Gallium.ip(regs)) == 0) || return RemotePtr{Void}(0)
-        addr = Gallium.get_dwarf(regs, :rax)
-        RemotePtr{Void}(addr)
-    end
-end
-
-Gallium.retrieve_obj_data(task::RR.ReplayTask, ip) =
-    Gallium.retrieve_obj_data(icxx"&$task->session();", ip)
-    
-Gallium.retrieve_section_start(task::RR.ReplayTask, ip) =
-    Gallium.retrieve_section_start(icxx"&$task->session();", ip)
-
 include("remoteclang.jl")
 Cxx.cxxinclude(RemoteClang, "/home/kfischer/julia/src/interpreter.c")
 

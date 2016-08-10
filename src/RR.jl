@@ -43,6 +43,9 @@ module RR
         @assert Ptr{Void}(task) != C_NULL
         task
     end
+    Base.current_task(timeline::ReplayTimeline) =
+        current_task(current_session(timeline))
+    Base.current_task(task::AnyTask) = task
 
     current_session(timeline::ReplayTimeline) = icxx"&$timeline->current_session();"
     current_session(session::Session) = session
@@ -62,10 +65,13 @@ module RR
     end
 
 
-    function step!(session::ReplaySession, target)
+    function step!(session::ReplaySession, target; target_is_event = false)
         icxx"""
             rr::ReplaySession::StepConstraints c(rr::RUN_CONTINUE);
-            c.ticks_target = $target;
+            if ($target_is_event)
+                c.stop_at_time = $target;
+            else
+                c.ticks_target = $target;
             $session->replay_step(c);
         """
     end
@@ -94,8 +100,9 @@ module RR
     reverse_single_step!(timeline) = reverse_single_step!(current_session(timeline),
         current_task(current_session(timeline)), timeline)
 
-    function single_step!(session::ReplaySession)
-        icxx"$session->replay_step(rr::RUN_SINGLESTEP);"
+    function Gallium.single_step!(session::ReplaySession)
+        while !icxx"$session->replay_step(rr::RUN_SINGLESTEP).break_status.singlestep_complete;"
+        end
     end
 
     function at_breakpoint(timeline::ReplayTimeline)
@@ -128,7 +135,7 @@ module RR
         return true
     end
 
-    function single_step!(timeline::ReplayTimeline)
+    function Gallium.single_step!(timeline::ReplayTimeline)
         # To get past any breakpoints, check if our current location
         # is a breakpoint location and if so, temporarily clear it
         # while stepping past.
@@ -139,14 +146,14 @@ module RR
             disable(loc)
             did_disable = true
         end
-        res = single_step!(current_session(timeline))
+        res = Gallium.single_step!(current_session(timeline))
         if did_disable
             enable(loc)
         end
         res
     end
 
-    function step_until_bkpt!(session::ReplaySession)
+    function Gallium.step_until_bkpt!(session::ReplaySession)
         while disable_sigint() do
                 !icxx"$session->replay_step(rr::RUN_CONTINUE).break_status.breakpoint_hit;"
             end
@@ -159,12 +166,13 @@ module RR
     end
     
     function is_task_exit(status)
-        icxx"$status.task_exit;"
+        icxx"$status.task_exit == true;"
     end
     
     is_break_sig(status) = icxx"$status.signal == 11;" || icxx"$status.signal == 4;"
 
-    function step_until_bkpt!(timeline::ReplayTimeline)
+    function Gallium.step_until_bkpt!(timeline::ReplayTimeline; only_current_tgid = false)
+        current_tgid = icxx"$(current_task(timeline))->tgid();"
         while true
             icxx"$timeline->apply_breakpoints_and_watchpoints();"
             icxx"$(current_session(timeline))->set_visible_execution(true);"
@@ -176,8 +184,10 @@ module RR
                  is_last_thread_exit(icxx"$res.break_status;") ||
                  is_break_sig(icxx"$res.break_status;"))
             end
-            exited && return (false, res)
-            bp_hit && return (true, res)
+            if !only_current_tgid || icxx"$(current_task(timeline))->tgid();" == current_tgid
+                exited && return (false, res)
+                bp_hit && return (true, res)
+            end
             icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
         end
     end
@@ -186,25 +196,25 @@ module RR
         if disable_bps
             icxx"$timeline->unapply_breakpoints_and_watchpoints();"
         else
-            single_step!(timeline)
+            Gallium.single_step!(timeline)
         end
         icxx"$(current_task(current_session(timeline)))->vm()->add_breakpoint($theip, rr::BKPT_USER);"
-        RR.step_until_bkpt!(current_session(timeline))
+        Gallium.step_until_bkpt!(current_session(timeline))
         icxx"$(current_task(current_session(timeline)))->vm()->remove_breakpoint($theip, rr::BKPT_USER);"
         disable_bps && icxx"$timeline->apply_breakpoints_and_watchpoints();"
         nothing
     end
     
-    function continue!(timeline)
+    function Gallium.continue!(timeline::ReplayTimeline; only_current_tgid = false)
         while true
-            bp_hit, res = step_until_bkpt!(timeline)
+            bp_hit, res = Gallium.step_until_bkpt!(timeline; only_current_tgid = only_current_tgid)
             bp_hit || return res
             regs = icxx"$(current_task(current_session(timeline)))->regs();"
             if process_lowlevel_conditionals(Location(timeline, ip(regs)), regs)
                 return res
             end
             # Step past the breakpoint
-            single_step!(timeline)
+            Gallium.single_step!(timeline)
         end
     end
 
@@ -217,16 +227,17 @@ module RR
         end
     end
 
-    function read_exe(task::AnyTask)
+    function Gallium.read_exe(task::AnyTask)
         @assert task != C_NULL
         readmeta(IOBuffer(open(read,Cxx.unsafe_string(icxx"$task->vm()->exe_image();"))))
     end
 
-    function read_exe(session::Session)
-        read_exe(current_task(session))
+    function Gallium.read_exe(session::Session)
+        Gallium.read_exe(current_task(session))
     end
     
-    read_exe(timeline::ReplayTimeline) = read_exe(current_session(timeline))
+    Gallium.read_exe(timeline::ReplayTimeline) =
+        Gallium.read_exe(current_session(timeline))
 
     using Gallium.Hooking: PROT_READ, PROT_WRITE
     # Mapping remote mappings
@@ -262,12 +273,14 @@ module RR
 
     typealias RRRemotePtr{T} Union{RemotePtr{T}, cxxt"rr::remote_ptr<$T>"}
     Gallium.RemotePtr{T}(ptr::cxxt"rr::remote_ptr<$T>") = Gallium.RemotePtr{T}(UInt64(ptr))
+    Gallium.RemoteCodePtr(ptr::cxxt"rr::remote_code_ptr") = Gallium.RemoteCodePtr(UInt64(ptr))
     function load{T<:Cxx.CxxBuiltinTypes}(vm::AnyTask, ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
         res = icxx"$vm->read_mem($ptr,&$ok);"
         ok[] || error("Failed to read memory at address $ptr")
         res
     end
+    load(vm::ReplaySession, ptr) = load(current_task(vm), ptr)
 
     function load{T}(vm::AnyTask, ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
@@ -338,6 +351,15 @@ module RR
     mapped_file(vm::ReplayTimeline, ptr) =
         mapped_file(current_task(current_session(vm)), ptr)
 
+    function Gallium.segment_base(vm::AnyTask, ptr)
+        ptr = UInt64(ptr)
+        @assert icxx"$vm->vm()->has_mapping($ptr);"
+        Gallium.RemotePtr(icxx"$vm->vm()->mapping_of($ptr).map.start();")
+    end
+    Gallium.segment_base(vm::ReplayTimeline, ptr) =
+        Gallium.segment_base(current_task(current_session(vm)), ptr)
+    
+
     import Gallium.GlibcDyldModules: load_library_map, compute_entry_ptr
     function load_library_map(task::pcpp"rr::ReplayTask", imageh)
         slide = compute_entry_ptr(saved_auxv(task)) -
@@ -350,7 +372,7 @@ module RR
     const RRRegisters = Union{rcpp"rr::Registers",vcpp"rr::Registers"}
 
     Base.copy(regs::RRRegisters) = icxx"rr::Registers{$regs};"
-    ip(regs::RRRegisters) = icxx"$regs.ip();"
+    ip(regs::RRRegisters) = RemoteCodePtr(icxx"$regs.ip();")
     invalidate_regs!(regs::RRRegisters) = nothing # RR does not track validity
     set_sp!(regs::RRRegisters, sp) = icxx"$regs.set_sp($(RemotePtr{Void}(sp)));"
     set_ip!(regs::RRRegisters, ip) = icxx"$regs.set_ip($(RemoteCodePtr(ip)));"
@@ -437,4 +459,69 @@ module RR
     Gallium.ip(task::AnyTask) = Gallium.ip(icxx"$task->regs();")
     Gallium.ip(timeline::ReplayTimeline) = Gallium.ip(current_task(current_session(timeline)))
 
+    function Gallium.breakpoint(timeline::RR.ReplayTimeline, modules, fname::Symbol)
+        syms = Gallium.lookup_syms(timeline, modules, fname)
+        bp = Gallium.Breakpoint()
+        for (h, base, sym) in syms
+            addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
+            Gallium.add_location(bp, Gallium.Location(timeline, addr))
+        end
+        bp
+    end
+
+    function Gallium.breakpoint(timeline::RR.ReplayTimeline, addr)
+        bp = Gallium.Breakpoint()
+        Gallium.add_location(bp, Gallium.Location(timeline, addr))
+        bp
+    end
+
+    function Gallium.enable(timeline::RR.ReplayTimeline, loc::Location)
+        icxx"$timeline->add_breakpoint(
+                $(current_task(current_session(timeline))), $(loc.addr));"
+    end
+
+    function Gallium.disable(timeline::RR.ReplayTimeline, loc::Location)
+        icxx"$timeline->remove_breakpoint(
+                $(current_task(current_session(timeline))), $(loc.addr));"
+    end
+
+    function Gallium.print_location(io::IO, vm::RR.ReplayTimeline, loc)
+        print(io, "In RR timeline at address ")
+        show(io, loc.addr)
+        println(io)
+    end
+
+    Gallium.getregs(task::AnyTask) = icxx"$task->regs();"
+    Gallium.getregs(timeline::ReplayTimeline) =
+        Gallium.getregs(current_task(timeline))
+    
+    function replay(trace_dir="")
+        session = icxx"""rr::ReplaySession::create($(pointer(trace_dir)));"""
+        timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
+        session = nothing
+        icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+        icxx"$(current_session(timeline))->set_visible_execution(true);"
+        icxx"""
+            rr::ReplaySession::Flags result;
+            result.redirect_stdio = true;
+            $(current_session(timeline))->set_flags(result);
+        """
+        RR.step_until_exec!(current_session(timeline))
+        task = current_task(current_session(timeline))
+        regs = Gallium.getregs(task)
+        rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
+        icxx"""
+        rr::AutoRemoteSyscalls remote($task);
+        """
+        icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+        entrypt = compute_entry_ptr(RR.saved_auxv(task))
+        icxx"$timeline->add_breakpoint($task, $entrypt);"
+        Gallium.step_until_bkpt!(timeline)
+        icxx"$timeline->remove_breakpoint($task, $entrypt);"
+        icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+        imageh = Gallium.read_exe(current_session(timeline))
+        modules = Gallium.GlibcDyldModules.load_library_map(task, imageh)
+
+        timeline, modules
+    end
 end # module

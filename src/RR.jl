@@ -5,6 +5,8 @@ module RR
     import Gallium: load, store!, mapped_file, enable, disable
     using Gallium: process_lowlevel_conditionals, Location
     using ObjFileBase
+    
+    import Base: ==
 
     function __init__()
         Libdl.dlopen(joinpath(ENV["HOME"],"rr-build/lib/librr.so"),
@@ -218,6 +220,17 @@ module RR
         end
     end
 
+    immutable TraceFrameIterator
+        reader
+    end
+    
+    Base.start(it::TraceFrameIterator) = nothing
+    function Base.next(it::TraceFrameIterator, _)
+        icxx"$(it.reader).read_frame();", nothing
+    end
+    Base.done(it::TraceFrameIterator, _) = icxx"$(it.reader).at_end();"
+    Base.iteratorsize(it::TraceFrameIterator) = Base.SizeUnknown()
+
     function Base.show(io::IO, frame::rcpp"rr::TraceFrame")
         print(io,icxx"$frame.ticks();",": ")
         print_with_color(:green,io,bytestring(icxx"$frame.event().str();"))
@@ -257,6 +270,12 @@ module RR
         r
     end
 
+    immutable TaskUid
+        tuid::cxxt"rr::TaskUid"
+    end
+    ==(a::TaskUid, b::TaskUid) = icxx"$(a.tuid) == $(b.tuid);"
+    tuid(task::AnyTask) = TaskUid(icxx"$task->tuid();")
+
     # Remote memory operations
     function Cxx.cppconvert{T}(ptr::RemotePtr{T})
         icxx"rr::remote_ptr<$T>{$(ptr.ptr)};"
@@ -271,7 +290,7 @@ module RR
     Base.convert{T}(::Type{RemotePtr{T}}, ptr::cxxt"rr::remote_ptr<$T>") =
         RemotePtr{T}(UInt(ptr))
 
-    typealias RRRemotePtr{T} Union{RemotePtr{T}, cxxt"rr::remote_ptr<$T>"}
+    typealias RRRemotePtr{T} Union{RemotePtr{T,UInt32}, RemotePtr{T,UInt64}, cxxt"rr::remote_ptr<$T>"}
     Gallium.RemotePtr{T}(ptr::cxxt"rr::remote_ptr<$T>") = Gallium.RemotePtr{T}(UInt64(ptr))
     Gallium.RemoteCodePtr(ptr::cxxt"rr::remote_code_ptr") = Gallium.RemoteCodePtr(UInt64(ptr))
     function load{T<:Cxx.CxxBuiltinTypes}(vm::AnyTask, ptr::RRRemotePtr{T})
@@ -362,32 +381,74 @@ module RR
 
     import Gallium.GlibcDyldModules: load_library_map, compute_entry_ptr
     function load_library_map(task::pcpp"rr::ReplayTask", imageh)
-        slide = compute_entry_ptr(saved_auxv(task)) -
+        slide = compute_entry_ptr(task, saved_auxv(task)) -
             imageh.file.header.e_entry
         load_library_map(task, imageh, slide)
     end
 
     # Registers
-    import Gallium.Registers: ip, invalidate_regs!, set_sp!, set_ip!, set_dwarf!, get_dwarf
+    import Gallium.Registers: ip, invalidate_regs!, set_sp!, set_ip!,
+        set_dwarf!, get_dwarf, getarch
     const RRRegisters = Union{rcpp"rr::Registers",vcpp"rr::Registers"}
 
+    getarch(regs::RRRegisters) = icxx"$regs.arch() == rr::x86_64;" ?
+        Gallium.X86_64.X86_64Arch() : Gallium.X86_32.X86_32Arch()
+    getarch(task::AnyTask) = icxx"$task->arch() == rr::x86_64;" ?
+        Gallium.X86_64.X86_64Arch() : Gallium.X86_32.X86_32Arch()
+    getarch(timeline::ReplayTimeline) = getarch(current_task(current_session(timeline)))
     Base.copy(regs::RRRegisters) = icxx"rr::Registers{$regs};"
     ip(regs::RRRegisters) = RemoteCodePtr(icxx"$regs.ip();")
     invalidate_regs!(regs::RRRegisters) = nothing # RR does not track validity
     set_sp!(regs::RRRegisters, sp) = icxx"$regs.set_sp($(RemotePtr{Void}(sp)));"
     set_ip!(regs::RRRegisters, ip) = icxx"$regs.set_ip($(RemoteCodePtr(ip)));"
     function set_dwarf!(regs::RRRegisters, regno::Integer, val)
-        gdbregno = Gallium.X86_64.dwarf2gdb(regno)
-        valr = Ref{UInt64}(UInt64(val))
-        icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,sizeof(uintptr_t));"
+        if isa(getarch(regs), Gallium.X86_64.X86_64Arch)
+            # fs_base and gs_base do not have gdb equivalents
+            if regno == Gallium.X86_64.inverse_dwarf[:fs_base]
+                return icxx"$regs.fs_base();"
+            elseif regno == Gallium.X86_64.inverse_dwarf[:gs_base]
+                return icxx"$regs.gs_base();"
+            end
+            gdbregno = Gallium.X86_64.dwarf2gdb(regno)
+            valr = Ref{UInt64}(UInt64(val))
+            icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,$(sizeof(UInt64)));"
+        else
+            gdbregno = Gallium.X86_32.dwarf2gdb(regno)
+            @show val
+            valr = Ref{UInt32}(UInt32(val))
+            icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,$(sizeof(UInt32)));"
+        end
     end
     function get_dwarf(regs::RRRegisters, regno::Integer)
-        gdbregno = Gallium.X86_64.dwarf2gdb(regno)
+        if isa(getarch(regs), Gallium.X86_64.X86_64Arch)
+            # fs_base and gs_base do not have gdb equivalents
+            if regno == Gallium.X86_64.inverse_dwarf[:fs_base]
+                return icxx"$regs.fs_base();"
+            elseif regno == Gallium.X86_64.inverse_dwarf[:gs_base]
+                return icxx"$regs.gs_base();"
+            end
+            gdbregno = Gallium.X86_64.dwarf2gdb(regno)
+        else
+            gdbregno = Gallium.X86_32.dwarf2gdb(regno)
+        end
         buf = Ref{UInt64}(0)
         defined = Ref{Bool}()
         icxx"$regs.read_register((uint8_t*)&$buf, (rr::GdbRegister)$gdbregno, &$defined);"
         buf[]
     end
+
+    function Gallium.get_thread_area_base(task::AnyTask, entry)
+        icxx"""
+            for (auto &area : $task->thread_areas()) {
+                if (area.entry_number == $entry) {
+                    return area.base_addr;
+                }
+            }
+            return (unsigned int)0;
+        """
+    end
+    Gallium.get_thread_area_base(timeline::ReplayTimeline, entry) =
+        Gallium.get_thread_area_base(current_task(timeline), entry)
 
     """
         RR hooks syscall instructions by inserting a call instruction and
@@ -463,7 +524,8 @@ module RR
         syms = Gallium.lookup_syms(timeline, modules, fname)
         bp = Gallium.Breakpoint()
         for (h, base, sym) in syms
-            addr = Gallium.RemoteCodePtr(base + ObjFileBase.deref(sym).st_value)
+            addr = Gallium.RemoteCodePtr(base + ObjFileBase.symbolvalue(sym,
+                ObjFileBase.Sections(ObjFileBase.handle(h))))
             Gallium.add_location(bp, Gallium.Location(timeline, addr))
         end
         bp
@@ -514,7 +576,7 @@ module RR
         rr::AutoRemoteSyscalls remote($task);
         """
         icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-        entrypt = compute_entry_ptr(RR.saved_auxv(task))
+        entrypt = compute_entry_ptr(task,RR.saved_auxv(task))
         icxx"$timeline->add_breakpoint($task, $entrypt);"
         Gallium.step_until_bkpt!(timeline)
         icxx"$timeline->remove_breakpoint($task, $entrypt);"

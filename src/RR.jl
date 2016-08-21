@@ -183,6 +183,7 @@ module RR
                 res = icxx"$(current_session(timeline))->replay_step(rr::RUN_CONTINUE);"
                 (icxx"$res.status == rr::REPLAY_EXITED;",
                  icxx"$res.break_status.breakpoint_hit;" ||
+                 icxx"!$res.break_status.watchpoints_hit.empty();" ||
                  is_last_thread_exit(icxx"$res.break_status;") ||
                  is_break_sig(icxx"$res.break_status;"))
             end

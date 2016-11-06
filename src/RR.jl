@@ -9,10 +9,11 @@ module RR
     import Base: ==
 
     function __init__()
-        Libdl.dlopen(joinpath(ENV["HOME"],"rr-build/lib/librr.so"),
+        DEPS_DIR = joinpath(dirname(@__FILE__),"..","deps")
+        Libdl.dlopen(joinpath(DEPS_DIR,"usr/lib/librr.so"),
             Libdl.RTLD_GLOBAL)
-        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr/src"), kind = C_System)
-        Cxx.addHeaderDir(joinpath(ENV["HOME"],"rr-build"), kind = C_System)
+        Cxx.addHeaderDir(joinpath(DEPS_DIR,"src/rr/src"), kind = C_System)
+        Cxx.addHeaderDir(joinpath(DEPS_DIR,"build/rr"), kind = C_System)
         cxx"""
             #include <RecordSession.h>
             #include <RecordTask.h>

@@ -104,7 +104,13 @@ module RR
         current_task(current_session(timeline)), timeline)
 
     function Gallium.single_step!(session::ReplaySession)
-        while !icxx"$session->replay_step(rr::RUN_SINGLESTEP).break_status.singlestep_complete;"
+        while true
+            status = icxx"$session->replay_step(rr::RUN_SINGLESTEP);"
+            if icxx"$status.break_status.singlestep_complete == true;"
+                return true
+            elseif icxx"$status.status == rr::REPLAY_EXITED;"
+                return false
+            end
         end
     end
 
@@ -172,7 +178,9 @@ module RR
         icxx"$status.task_exit == true;"
     end
     
-    is_break_sig(status) = icxx"$status.signal == 11;" || icxx"$status.signal == 4;"
+    is_break_sig(status) = icxx"$status.signal != nullptr;" && (
+      icxx"$status.signal->si_signo == 11;" ||
+      icxx"$status.signal->si_signo == 4;")
 
     function Gallium.step_until_bkpt!(timeline::ReplayTimeline; only_current_tgid = false)
         current_tgid = icxx"$(current_task(timeline))->tgid();"
@@ -233,11 +241,11 @@ module RR
     Base.done(it::TraceFrameIterator, _) = icxx"$(it.reader).at_end();"
     Base.iteratorsize(it::TraceFrameIterator) = Base.SizeUnknown()
 
-    function Base.show(io::IO, frame::rcpp"rr::TraceFrame")
+    function Base.show(io::IO, frame::Union{rcpp"rr::TraceFrame",vcpp"rr::TraceFrame"})
         print(io,icxx"$frame.ticks();",": ")
-        print_with_color(:green,io,bytestring(icxx"$frame.event().str();"))
+        print_with_color(:green,io,String(icxx"$frame.event().str();"))
         if icxx"$frame.event().is_syscall_event();"
-            println(io, " ", bytestring(
+             println(io, " ", unsafe_string(
                 icxx"rr::state_name($frame.event().Syscall().state);"))
         end
     end
@@ -367,7 +375,11 @@ module RR
 
     function mapped_file(vm::AnyTask, ptr)
         @assert icxx"$vm->vm()->has_mapping($ptr);"
-        unsafe_string(icxx"$vm->vm()->mapping_of($ptr).map.fsname();")
+        unsafe_string(icxx"""
+            auto &mapping = $vm->vm()->mapping_of($ptr);
+            return mapping.recorded_map.is_vdso() ?
+              "linux-vdso.so.1" : mapping.map.fsname().c_str();
+        """)
     end
     mapped_file(vm::ReplayTimeline, ptr) =
         mapped_file(current_task(current_session(vm)), ptr)
@@ -438,6 +450,14 @@ module RR
         icxx"$regs.read_register((uint8_t*)&$buf, (rr::GdbRegister)$gdbregno, &$defined);"
         buf[]
     end
+    function Base.convert(::Type{Gallium.X86_64.BasicRegs}, regs::RRRegisters)
+        retregs = Gallium.X86_64.BasicRegs()
+        for i in Gallium.X86_64.basic_regs
+            set_dwarf!(retregs, i, get_dwarf(regs, i))
+        end
+        retregs
+    end
+    Base.show(io::IO, regs::RRRegisters) = show(io, Gallium.X86_64.BasicRegs(regs))
 
     function Gallium.get_thread_area_base(task::AnyTask, entry)
         icxx"""
@@ -559,7 +579,7 @@ module RR
     Gallium.getregs(timeline::ReplayTimeline) =
         Gallium.getregs(current_task(timeline))
     
-    function replay(trace_dir="")
+    function replay(trace_dir=""; step_to_entry=true)
         session = icxx"""rr::ReplaySession::create($(pointer(trace_dir)));"""
         timeline = icxx"""new rr::ReplayTimeline{std::move($session),rr::ReplaySession::Flags{}};""";
         session = nothing
@@ -572,20 +592,85 @@ module RR
         """
         RR.step_until_exec!(current_session(timeline))
         task = current_task(current_session(timeline))
-        regs = Gallium.getregs(task)
-        rsp = Gallium.get_dwarf(regs, Gallium.X86_64.inverse_dwarf[:rsp])
-        icxx"""
-        rr::AutoRemoteSyscalls remote($task);
-        """
-        icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
-        entrypt = compute_entry_ptr(task,RR.saved_auxv(task))
-        icxx"$timeline->add_breakpoint($task, $entrypt);"
-        Gallium.step_until_bkpt!(timeline)
-        icxx"$timeline->remove_breakpoint($task, $entrypt);"
-        icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+        if step_to_entry
+          icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+          entrypt = compute_entry_ptr(task,RR.saved_auxv(task))
+          icxx"$timeline->add_breakpoint($task, $entrypt);"
+          Gallium.step_until_bkpt!(timeline)
+          icxx"$timeline->remove_breakpoint($task, $entrypt);"
+          icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
+        end
         imageh = Gallium.read_exe(current_session(timeline))
         modules = Gallium.GlibcDyldModules.load_library_map(task, imageh)
 
         timeline, modules
     end
+    
+    const preload_thread_locals = 0x70001000
+    const stub_scratch_1 = preload_thread_locals
+    function unwind_step_rr_extended_jump(sess, base, RC)
+        RC′ = copy(RC)
+        # First figure out which stub we're in and how far
+        # we're into the stub
+        arch = Gallium.getarch(sess)
+        stub_size = isa(arch, Gallium.X86_64.X86_64Arch) ?
+          79 : 44
+        ptrT = Gallium.intptr(arch)
+        ip = UInt64(Gallium.ip(RC))
+        procrel = rem(ip-base, stub_size)
+        if procrel != 0
+            set_dwarf!(RC′, :rsp, Gallium.load(sess,
+              RemotePtr{ptrT,ptrT}(preload_thread_locals+sizeof(ptrT))))
+        end
+        local return_addr
+        if isa(arch, Gallium.X86_64.X86_64Arch)
+            lo = Gallium.load(sess, RemotePtr{UInt32, UInt64}(ip-procrel+53))
+            hi = Gallium.load(sess, RemotePtr{UInt32, UInt64}(ip-procrel+61))
+            return_addr = (UInt64(hi) << 32) | lo
+            jump_stub = Gallium.load(sess, RemotePtr{UInt64, UInt64}(ip-procrel+71))
+            if Gallium.load(sess, RemotePtr{UInt32, UInt64}(jump_stub+5)) == 0x5e5a5c5a 
+                # This is the _syscall_hook_trampoline_5a_5e_c3, which doesn't
+                # return to where it was called, because the function is too short
+                # Just pretend we're before the syscall.
+                return_addr -= 5
+            end
+        else
+            return_addr = Gallium.load(sess, RemotePtr{UInt32, UInt32}(ip-procrel+35))
+        end
+        set_ip!(RC′, return_addr)
+        RC′
+    end
+    
+    function get_synthetic_modules(session)
+        modules = Dict{RR.AddressSpaceUid,Dict{Gallium.RemotePtr{Void},Gallium.SyntheticModule}}()
+        reader = icxx"rr::TraceReader{$(RR.current_session(session))->trace_reader()};"
+        icxx"$reader.rewind();"
+        for frame in RR.TraceFrameIterator(reader)
+            start = Ref{UInt64}(0)
+            size = Ref{UInt64}(0)
+            while icxx"""
+                bool found = false;
+                auto km = $reader.read_mapped_region(nullptr, &found);
+                if (found) {
+                  $start = km.start().as_int();
+                  $size = km.size();
+                }
+                return found;
+                """
+                if icxx"$frame.event().type() == rr::EV_PATCH_SYSCALL;"
+                    symbolicate = (session, RC)->(true, "RR Syscall Stub")
+                    get_proc_bounds = (session, ip)->(0x1:0x1000)-1
+                    # XXX: This is incorrect for multi-as replays
+                    asid = Gallium.current_asid(session)
+                    !haskey(modules, asid) &&
+                      (modules[asid] = Dict{UInt64,Gallium.SyntheticModule}())
+                    modules[asid][Gallium.RemotePtr{Void}(start[])] =
+                      Gallium.SyntheticModule(start[], size[],
+                        unwind_step_rr_extended_jump, symbolicate, get_proc_bounds)
+                end
+            end
+        end
+        modules
+    end
+    
 end # module

@@ -1,9 +1,9 @@
 module RR
 
     using Cxx
-    using Gallium
-    import Gallium: load, store!, mapped_file, enable, disable
-    using Gallium: process_lowlevel_conditionals, Location
+    using NativeDebugger
+    import NativeDebugger: fallible_load, load, store!, mapped_file, enable, disable, ip
+    using NativeDebugger: Location
     using ObjFileBase
     
     import Base: ==
@@ -22,6 +22,7 @@ module RR
             #include <AutoRemoteSyscalls.h>
             #include <GdbServer.h>
             #include <algorithm>
+            #include <kernel_metadata.h>
         """
     end
     __init__()
@@ -103,7 +104,7 @@ module RR
     reverse_single_step!(timeline) = reverse_single_step!(current_session(timeline),
         current_task(current_session(timeline)), timeline)
 
-    function Gallium.single_step!(session::ReplaySession)
+    function NativeDebugger.single_step!(session::ReplaySession)
         while true
             status = icxx"$session->replay_step(rr::RUN_SINGLESTEP);"
             if icxx"$status.break_status.singlestep_complete == true;"
@@ -115,9 +116,9 @@ module RR
     end
 
     function at_breakpoint(timeline::ReplayTimeline)
-        loc = Gallium.Location(timeline,
+        loc = NativeDebugger.Location(timeline,
             ip(icxx"$(current_task(current_session(timeline)))->regs();"))
-        haskey(Gallium.bps_at_location, loc)        
+        haskey(NativeDebugger.bps_at_location, loc)        
     end
 
     function orig_byte(task,addr)
@@ -139,30 +140,30 @@ module RR
         """ && return false
         insts = load(task, RemotePtr{UInt8}(ip(regs)), 15)
         insts[1] = orig_byte(task, addr)
-        Gallium.X86_64.instemulate!(insts, vm, regs) || return false
+        NativeDebugger.X86_64.instemulate!(insts, vm, regs) || return false
         icxx"$task->set_regs($regs);"
         return true
     end
 
-    function Gallium.single_step!(timeline::ReplayTimeline)
+    function NativeDebugger.single_step!(timeline::ReplayTimeline)
         # To get past any breakpoints, check if our current location
         # is a breakpoint location and if so, temporarily clear it
         # while stepping past.
         did_disable = false
-        loc = Gallium.Location(timeline,
+        loc = NativeDebugger.Location(timeline,
             ip(icxx"$(current_task(current_session(timeline)))->regs();"))
-        if haskey(Gallium.bps_at_location, loc)
+        if haskey(NativeDebugger.bps_at_location, loc)
             disable(loc)
             did_disable = true
         end
-        res = Gallium.single_step!(current_session(timeline))
+        res = NativeDebugger.single_step!(current_session(timeline))
         if did_disable
             enable(loc)
         end
         res
     end
 
-    function Gallium.step_until_bkpt!(session::ReplaySession)
+    function NativeDebugger.step_until_bkpt!(session::ReplaySession)
         while disable_sigint() do
                 !icxx"$session->replay_step(rr::RUN_CONTINUE).break_status.breakpoint_hit;"
             end
@@ -182,7 +183,7 @@ module RR
       icxx"$status.signal->si_signo == 11;" ||
       icxx"$status.signal->si_signo == 4;")
 
-    function Gallium.step_until_bkpt!(timeline::ReplayTimeline; only_current_tgid = false)
+    function NativeDebugger.step_until_bkpt!(timeline::ReplayTimeline; only_current_tgid = false)
         current_tgid = icxx"$(current_task(timeline))->tgid();"
         while true
             icxx"$timeline->apply_breakpoints_and_watchpoints();"
@@ -208,25 +209,25 @@ module RR
         if disable_bps
             icxx"$timeline->unapply_breakpoints_and_watchpoints();"
         else
-            Gallium.single_step!(timeline)
+            NativeDebugger.single_step!(timeline)
         end
         icxx"$(current_task(current_session(timeline)))->vm()->add_breakpoint($theip, rr::BKPT_USER);"
-        Gallium.step_until_bkpt!(current_session(timeline))
+        NativeDebugger.step_until_bkpt!(current_session(timeline))
         icxx"$(current_task(current_session(timeline)))->vm()->remove_breakpoint($theip, rr::BKPT_USER);"
         disable_bps && icxx"$timeline->apply_breakpoints_and_watchpoints();"
         nothing
     end
     
-    function Gallium.continue!(timeline::ReplayTimeline; only_current_tgid = false)
+    function NativeDebugger.continue!(timeline::ReplayTimeline; only_current_tgid = false)
         while true
-            bp_hit, res = Gallium.step_until_bkpt!(timeline; only_current_tgid = only_current_tgid)
+            bp_hit, res = NativeDebugger.step_until_bkpt!(timeline; only_current_tgid = only_current_tgid)
             bp_hit || return res
             regs = icxx"$(current_task(current_session(timeline)))->regs();"
             if process_lowlevel_conditionals(Location(timeline, ip(regs)), regs)
                 return res
             end
             # Step past the breakpoint
-            Gallium.single_step!(timeline)
+            NativeDebugger.single_step!(timeline)
         end
     end
 
@@ -249,20 +250,21 @@ module RR
                 icxx"rr::state_name($frame.event().Syscall().state);"))
         end
     end
+    tid(frame::Union{rcpp"rr::TraceFrame",vcpp"rr::TraceFrame"}) = icxx"$frame.tid();"
+    time(frame::Union{rcpp"rr::TraceFrame",vcpp"rr::TraceFrame"}) = icxx"$frame.time();"
 
-    function Gallium.read_exe(task::AnyTask)
+    function NativeDebugger.read_exe(task::AnyTask)
         @assert task != C_NULL
         readmeta(IOBuffer(open(read,Cxx.unsafe_string(icxx"$task->vm()->exe_image();"))))
     end
 
-    function Gallium.read_exe(session::Session)
-        Gallium.read_exe(current_task(session))
+    function NativeDebugger.read_exe(session::Session)
+        NativeDebugger.read_exe(current_task(session))
     end
     
-    Gallium.read_exe(timeline::ReplayTimeline) =
-        Gallium.read_exe(current_session(timeline))
+    NativeDebugger.read_exe(timeline::ReplayTimeline) =
+        NativeDebugger.read_exe(current_session(timeline))
 
-    using Gallium.Hooking: PROT_READ, PROT_WRITE
     # Mapping remote mappings
     function map_remote(task, mapping::cxxt"const rr::KernelMapping*")
         fd = icxx"""
@@ -301,8 +303,8 @@ module RR
         RemotePtr{T}(UInt(ptr))
 
     typealias RRRemotePtr{T} Union{RemotePtr{T,UInt32}, RemotePtr{T,UInt64}, cxxt"rr::remote_ptr<$T>"}
-    Gallium.RemotePtr{T}(ptr::cxxt"rr::remote_ptr<$T>") = Gallium.RemotePtr{T}(UInt64(ptr))
-    Gallium.RemoteCodePtr(ptr::cxxt"rr::remote_code_ptr") = Gallium.RemoteCodePtr(UInt64(ptr))
+    NativeDebugger.RemotePtr{T}(ptr::cxxt"rr::remote_ptr<$T>") = NativeDebugger.RemotePtr{T}(UInt64(ptr))
+    NativeDebugger.RemoteCodePtr(ptr::cxxt"rr::remote_code_ptr") = NativeDebugger.RemoteCodePtr(UInt64(ptr))
     function load{T<:Cxx.CxxBuiltinTypes}(vm::AnyTask, ptr::RRRemotePtr{T})
         ok = Ref{Bool}(true)
         res = icxx"$vm->read_mem($ptr,&$ok);"
@@ -350,6 +352,16 @@ module RR
         res
     end
 
+    function fallible_load{T}(vm::AnyTask, ptr::RRRemotePtr{T}, n)
+        ok = Ref{Bool}(true)
+        res = Vector{T}(n)
+        size = icxx"$vm->read_bytes_fallible(
+            rr::remote_ptr<uint8_t>($(UInt64(ptr))),
+            $(n*sizeof(T)),$(Ptr{UInt8}(pointer(res))));"
+        resize!(res, div(size, sizeof(T)))
+        res
+    end
+
     load(vm::ReplayTimeline, args...) =
         load(current_task(current_session(vm)), args...)
 
@@ -359,7 +371,7 @@ module RR
     # Task `12345` mmap_hardlink_1_julia at ip-loc
     function Base.show(io::IO, task::AnyTask)
         modules = get(io, :modules, nothing)
-        ip = UInt(Gallium.ip(fixup_RC(task,icxx"$task->regs();")[2]))
+        ip = UInt(NativeDebugger.ip(fixup_RC(task,icxx"$task->regs();")[2]))
         session = icxx"&$task->session();"
         ssession = icxx"$session->as_replay();"
         ssession == C_NULL && (ssession = icxx"$session->as_record();")
@@ -368,10 +380,10 @@ module RR
             icxx"$task->rec_tid;", ") ",
             unsafe_string(icxx"$task->vm()->exe_image();"),
             " at 0x",hex(ip)," ",modules !== nothing ?
-            Gallium.Unwinder.symbolicate(ssession, modules, ip) : "")
+            NativeDebugger.Unwinder.symbolicate(ssession, modules, ip) : "")
     end
 
-    saved_auxv(vm::pcpp"rr::ReplayTask") = map(unsafe_load,icxx"$vm->vm()->saved_auxv();")
+    saved_auxv(vm::pcpp"rr::ReplayTask") = convert(Vector{UInt8}, icxx"$vm->vm()->saved_auxv();")
 
     function mapped_file(vm::AnyTask, ptr)
         @assert icxx"$vm->vm()->has_mapping($ptr);"
@@ -384,16 +396,16 @@ module RR
     mapped_file(vm::ReplayTimeline, ptr) =
         mapped_file(current_task(current_session(vm)), ptr)
 
-    function Gallium.segment_base(vm::AnyTask, ptr)
+    function NativeDebugger.segment_base(vm::AnyTask, ptr)
         ptr = UInt64(ptr)
         @assert icxx"$vm->vm()->has_mapping($ptr);"
-        Gallium.RemotePtr(icxx"$vm->vm()->mapping_of($ptr).map.start();")
+        NativeDebugger.RemotePtr(icxx"$vm->vm()->mapping_of($ptr).map.start();")
     end
-    Gallium.segment_base(vm::ReplayTimeline, ptr) =
-        Gallium.segment_base(current_task(current_session(vm)), ptr)
+    NativeDebugger.segment_base(vm::ReplayTimeline, ptr) =
+        NativeDebugger.segment_base(current_task(current_session(vm)), ptr)
     
 
-    import Gallium.GlibcDyldModules: load_library_map, compute_entry_ptr
+    import NativeDebugger.GlibcDyldModules: load_library_map, compute_entry_ptr
     function load_library_map(task::pcpp"rr::ReplayTask", imageh)
         slide = compute_entry_ptr(task, saved_auxv(task)) -
             imageh.file.header.e_entry
@@ -401,14 +413,14 @@ module RR
     end
 
     # Registers
-    import Gallium.Registers: ip, invalidate_regs!, set_sp!, set_ip!,
+    import NativeDebugger.Registers: ip, invalidate_regs!, set_sp!, set_ip!,
         set_dwarf!, get_dwarf, getarch
     const RRRegisters = Union{rcpp"rr::Registers",vcpp"rr::Registers"}
 
     getarch(regs::RRRegisters) = icxx"$regs.arch() == rr::x86_64;" ?
-        Gallium.X86_64.X86_64Arch() : Gallium.X86_32.X86_32Arch()
+        NativeDebugger.X86_64.X86_64Arch() : NativeDebugger.X86_32.X86_32Arch()
     getarch(task::AnyTask) = icxx"$task->arch() == rr::x86_64;" ?
-        Gallium.X86_64.X86_64Arch() : Gallium.X86_32.X86_32Arch()
+        NativeDebugger.X86_64.X86_64Arch() : NativeDebugger.X86_32.X86_32Arch()
     getarch(timeline::ReplayTimeline) = getarch(current_task(current_session(timeline)))
     Base.copy(regs::RRRegisters) = icxx"rr::Registers{$regs};"
     ip(regs::RRRegisters) = RemoteCodePtr(icxx"$regs.ip();")
@@ -416,50 +428,50 @@ module RR
     set_sp!(regs::RRRegisters, sp) = icxx"$regs.set_sp($(RemotePtr{Void}(sp)));"
     set_ip!(regs::RRRegisters, ip) = icxx"$regs.set_ip($(RemoteCodePtr(ip)));"
     function set_dwarf!(regs::RRRegisters, regno::Integer, val)
-        if isa(getarch(regs), Gallium.X86_64.X86_64Arch)
+        if isa(getarch(regs), NativeDebugger.X86_64.X86_64Arch)
             # fs_base and gs_base do not have gdb equivalents
-            if regno == Gallium.X86_64.inverse_dwarf[:fs_base]
+            if regno == NativeDebugger.X86_64.inverse_dwarf[:fs_base]
                 return icxx"$regs.fs_base();"
-            elseif regno == Gallium.X86_64.inverse_dwarf[:gs_base]
+            elseif regno == NativeDebugger.X86_64.inverse_dwarf[:gs_base]
                 return icxx"$regs.gs_base();"
             end
-            gdbregno = Gallium.X86_64.dwarf2gdb(regno)
+            gdbregno = NativeDebugger.X86_64.dwarf2gdb(regno)
             valr = Ref{UInt64}(UInt64(val))
             icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,$(sizeof(UInt64)));"
         else
-            gdbregno = Gallium.X86_32.dwarf2gdb(regno)
+            gdbregno = NativeDebugger.X86_32.dwarf2gdb(regno)
             @show val
             valr = Ref{UInt32}(UInt32(val))
             icxx"$regs.write_register((rr::GdbRegister)$gdbregno,&$valr,$(sizeof(UInt32)));"
         end
     end
     function get_dwarf(regs::RRRegisters, regno::Integer)
-        if isa(getarch(regs), Gallium.X86_64.X86_64Arch)
+        if isa(getarch(regs), NativeDebugger.X86_64.X86_64Arch)
             # fs_base and gs_base do not have gdb equivalents
-            if regno == Gallium.X86_64.inverse_dwarf[:fs_base]
+            if regno == NativeDebugger.X86_64.inverse_dwarf[:fs_base]
                 return icxx"$regs.fs_base();"
-            elseif regno == Gallium.X86_64.inverse_dwarf[:gs_base]
+            elseif regno == NativeDebugger.X86_64.inverse_dwarf[:gs_base]
                 return icxx"$regs.gs_base();"
             end
-            gdbregno = Gallium.X86_64.dwarf2gdb(regno)
+            gdbregno = NativeDebugger.X86_64.dwarf2gdb(regno)
         else
-            gdbregno = Gallium.X86_32.dwarf2gdb(regno)
+            gdbregno = NativeDebugger.X86_32.dwarf2gdb(regno)
         end
         buf = Ref{UInt64}(0)
         defined = Ref{Bool}()
         icxx"$regs.read_register((uint8_t*)&$buf, (rr::GdbRegister)$gdbregno, &$defined);"
         buf[]
     end
-    function Base.convert(::Type{Gallium.X86_64.BasicRegs}, regs::RRRegisters)
-        retregs = Gallium.X86_64.BasicRegs()
-        for i in Gallium.X86_64.basic_regs
+    function Base.convert(::Type{NativeDebugger.X86_64.BasicRegs}, regs::RRRegisters)
+        retregs = NativeDebugger.X86_64.BasicRegs()
+        for i in NativeDebugger.X86_64.basic_regs
             set_dwarf!(retregs, i, get_dwarf(regs, i))
         end
         retregs
     end
-    Base.show(io::IO, regs::RRRegisters) = show(io, Gallium.X86_64.BasicRegs(regs))
+    Base.show(io::IO, regs::RRRegisters) = show(io, NativeDebugger.X86_64.BasicRegs(regs))
 
-    function Gallium.get_thread_area_base(task::AnyTask, entry)
+    function NativeDebugger.get_thread_area_base(task::AnyTask, entry)
         icxx"""
             for (auto &area : $task->thread_areas()) {
                 if (area.entry_number == $entry) {
@@ -469,8 +481,8 @@ module RR
             return (unsigned int)0;
         """
     end
-    Gallium.get_thread_area_base(timeline::ReplayTimeline, entry) =
-        Gallium.get_thread_area_base(current_task(timeline), entry)
+    NativeDebugger.get_thread_area_base(timeline::ReplayTimeline, entry) =
+        NativeDebugger.get_thread_area_base(current_task(timeline), entry)
 
     """
         RR hooks syscall instructions by inserting a call instruction and
@@ -527,57 +539,57 @@ module RR
         exec_count::UInt32
     end
     
-    Gallium.current_asid(task::AnyTask) = 
+    NativeDebugger.current_asid(task::AnyTask) = 
         reinterpret(AddressSpaceUid, [icxx"$task->vm()->uid();".data])[]
         
-    Gallium.current_asid(session::ReplaySession) =
-        Gallium.current_asid(current_task(session))
+    NativeDebugger.current_asid(session::ReplaySession) =
+        NativeDebugger.current_asid(current_task(session))
 
-    Gallium.current_asid(timeline::ReplayTimeline) =
-        Gallium.current_asid(current_session(timeline))
+    NativeDebugger.current_asid(timeline::ReplayTimeline) =
+        NativeDebugger.current_asid(current_session(timeline))
 
     silence!(timeline) =
         icxx"$(current_session(timeline))->set_visible_execution(false);"
 
-    Gallium.ip(task::AnyTask) = Gallium.ip(icxx"$task->regs();")
-    Gallium.ip(timeline::ReplayTimeline) = Gallium.ip(current_task(current_session(timeline)))
+    NativeDebugger.ip(task::AnyTask) = NativeDebugger.ip(icxx"$task->regs();")
+    NativeDebugger.ip(timeline::ReplayTimeline) = NativeDebugger.ip(current_task(current_session(timeline)))
 
-    function Gallium.breakpoint(timeline::RR.ReplayTimeline, modules, fname::Symbol)
-        syms = Gallium.lookup_syms(timeline, modules, fname)
-        bp = Gallium.Breakpoint()
+    function NativeDebugger.breakpoint(timeline::RR.ReplayTimeline, modules, fname::Symbol)
+        syms = NativeDebugger.lookup_syms(timeline, modules, fname)
+        bp = NativeDebugger.Breakpoint()
         for (h, base, sym) in syms
-            addr = Gallium.RemoteCodePtr(base + ObjFileBase.symbolvalue(sym,
+            addr = NativeDebugger.RemoteCodePtr(base + ObjFileBase.symbolvalue(sym,
                 ObjFileBase.Sections(ObjFileBase.handle(h))))
-            Gallium.add_location(bp, Gallium.Location(timeline, addr))
+            NativeDebugger.add_location(bp, NativeDebugger.Location(timeline, addr))
         end
         bp
     end
 
-    function Gallium.breakpoint(timeline::RR.ReplayTimeline, addr)
-        bp = Gallium.Breakpoint()
-        Gallium.add_location(bp, Gallium.Location(timeline, addr))
+    function NativeDebugger.breakpoint(timeline::RR.ReplayTimeline, addr)
+        bp = NativeDebugger.Breakpoint()
+        NativeDebugger.add_location(bp, NativeDebugger.Location(timeline, addr))
         bp
     end
 
-    function Gallium.enable(timeline::RR.ReplayTimeline, loc::Location)
+    function NativeDebugger.enable(timeline::RR.ReplayTimeline, loc::Location)
         icxx"$timeline->add_breakpoint(
                 $(current_task(current_session(timeline))), $(loc.addr));"
     end
 
-    function Gallium.disable(timeline::RR.ReplayTimeline, loc::Location)
+    function NativeDebugger.disable(timeline::RR.ReplayTimeline, loc::Location)
         icxx"$timeline->remove_breakpoint(
                 $(current_task(current_session(timeline))), $(loc.addr));"
     end
 
-    function Gallium.print_location(io::IO, vm::RR.ReplayTimeline, loc)
+    function NativeDebugger.print_location(io::IO, vm::RR.ReplayTimeline, loc)
         print(io, "In RR timeline at address ")
         show(io, loc.addr)
         println(io)
     end
 
-    Gallium.getregs(task::AnyTask) = icxx"$task->regs();"
-    Gallium.getregs(timeline::ReplayTimeline) =
-        Gallium.getregs(current_task(timeline))
+    NativeDebugger.getregs(task::AnyTask) = icxx"$task->regs();"
+    NativeDebugger.getregs(timeline::ReplayTimeline) =
+        NativeDebugger.getregs(current_task(timeline))
     
     function replay(trace_dir=""; step_to_entry=true)
         session = icxx"""rr::ReplaySession::create($(pointer(trace_dir)));"""
@@ -596,12 +608,12 @@ module RR
           icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
           entrypt = compute_entry_ptr(task,RR.saved_auxv(task))
           icxx"$timeline->add_breakpoint($task, $entrypt);"
-          Gallium.step_until_bkpt!(timeline)
+          NativeDebugger.step_until_bkpt!(timeline)
           icxx"$timeline->remove_breakpoint($task, $entrypt);"
           icxx"$timeline->maybe_add_reverse_exec_checkpoint(rr::ReplayTimeline::LOW_OVERHEAD);"
         end
-        imageh = Gallium.read_exe(current_session(timeline))
-        modules = Gallium.GlibcDyldModules.load_library_map(task, imageh)
+        imageh = NativeDebugger.read_exe(current_session(timeline))
+        modules = NativeDebugger.GlibcDyldModules.load_library_map(task, imageh)
 
         timeline, modules
     end
@@ -612,37 +624,37 @@ module RR
         RC′ = copy(RC)
         # First figure out which stub we're in and how far
         # we're into the stub
-        arch = Gallium.getarch(sess)
-        stub_size = isa(arch, Gallium.X86_64.X86_64Arch) ?
+        arch = NativeDebugger.getarch(sess)
+        stub_size = isa(arch, NativeDebugger.X86_64.X86_64Arch) ?
           79 : 44
-        ptrT = Gallium.intptr(arch)
-        ip = UInt64(Gallium.ip(RC))
+        ptrT = NativeDebugger.intptr(arch)
+        ip = UInt64(NativeDebugger.ip(RC))
         procrel = rem(ip-base, stub_size)
         if procrel != 0
-            set_dwarf!(RC′, :rsp, Gallium.load(sess,
+            set_dwarf!(RC′, :rsp, NativeDebugger.load(sess,
               RemotePtr{ptrT,ptrT}(preload_thread_locals+sizeof(ptrT))))
         end
         local return_addr
-        if isa(arch, Gallium.X86_64.X86_64Arch)
-            lo = Gallium.load(sess, RemotePtr{UInt32, UInt64}(ip-procrel+53))
-            hi = Gallium.load(sess, RemotePtr{UInt32, UInt64}(ip-procrel+61))
+        if isa(arch, NativeDebugger.X86_64.X86_64Arch)
+            lo = NativeDebugger.load(sess, RemotePtr{UInt32, UInt64}(ip-procrel+53))
+            hi = NativeDebugger.load(sess, RemotePtr{UInt32, UInt64}(ip-procrel+61))
             return_addr = (UInt64(hi) << 32) | lo
-            jump_stub = Gallium.load(sess, RemotePtr{UInt64, UInt64}(ip-procrel+71))
-            if Gallium.load(sess, RemotePtr{UInt32, UInt64}(jump_stub+5)) == 0x5e5a5c5a 
+            jump_stub = NativeDebugger.load(sess, RemotePtr{UInt64, UInt64}(ip-procrel+71))
+            if NativeDebugger.load(sess, RemotePtr{UInt32, UInt64}(jump_stub+5)) == 0x5e5a5c5a 
                 # This is the _syscall_hook_trampoline_5a_5e_c3, which doesn't
                 # return to where it was called, because the function is too short
                 # Just pretend we're before the syscall.
                 return_addr -= 5
             end
         else
-            return_addr = Gallium.load(sess, RemotePtr{UInt32, UInt32}(ip-procrel+35))
+            return_addr = NativeDebugger.load(sess, RemotePtr{UInt32, UInt32}(ip-procrel+35))
         end
         set_ip!(RC′, return_addr)
         RC′
     end
     
     function get_synthetic_modules(session)
-        modules = Dict{RR.AddressSpaceUid,Dict{Gallium.RemotePtr{Void},Gallium.SyntheticModule}}()
+        modules = Dict{RR.AddressSpaceUid,Dict{NativeDebugger.RemotePtr{Void},NativeDebugger.SyntheticModule}}()
         reader = icxx"rr::TraceReader{$(RR.current_session(session))->trace_reader()};"
         icxx"$reader.rewind();"
         for frame in RR.TraceFrameIterator(reader)
@@ -661,11 +673,11 @@ module RR
                     symbolicate = (session, RC)->(true, "RR Syscall Stub")
                     get_proc_bounds = (session, ip)->(0x1:0x1000)-1
                     # XXX: This is incorrect for multi-as replays
-                    asid = Gallium.current_asid(session)
+                    asid = NativeDebugger.current_asid(session)
                     !haskey(modules, asid) &&
-                      (modules[asid] = Dict{UInt64,Gallium.SyntheticModule}())
-                    modules[asid][Gallium.RemotePtr{Void}(start[])] =
-                      Gallium.SyntheticModule(start[], size[],
+                      (modules[asid] = Dict{UInt64,NativeDebugger.SyntheticModule}())
+                    modules[asid][NativeDebugger.RemotePtr{Void}(start[])] =
+                      NativeDebugger.SyntheticModule(start[], size[],
                         unwind_step_rr_extended_jump, symbolicate, get_proc_bounds)
                 end
             end
